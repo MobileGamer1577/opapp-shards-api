@@ -1,0 +1,16 @@
+{
+  "name": "opapp-shards-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OPAPP Shards-API – Cloudflare Worker + D1, trackt Allzeithochs & Kursverlauf der OPShards-Wechselkurse.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute opapp-shards --remote --file=./migrations/0001_init.sql",
+    "db:seed": "wrangler d1 execute opapp-shards --remote --file=./migrations/0002_seed_all_time_high.sql",
+    "db:ath": "wrangler d1 execute opapp-shards --remote --command=\"SELECT * FROM all_time_high;\""
+  },
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}

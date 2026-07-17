@@ -1,0 +1,5 @@
+node_modules/
+.wrangler/
+.dev.vars
+RELEASE_NOTES.md
+DEPLOY_STEPS.md
