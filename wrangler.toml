@@ -1,6 +1,6 @@
 name = "opapp-shards-api"
 main = "src/worker.js"
-compatibility_date = "2026-07-15"
+compatibility_date = "2026-07-10"
 
 # ✅ HIER ÄNDERN: database_id nach "wrangler d1 create opapp-shards"
 # (siehe DEPLOY_STEPS.md, Schritt 3) hier eintragen.
@@ -8,7 +8,6 @@ compatibility_date = "2026-07-15"
 binding = "DB"
 database_name = "opapp-shards"
 database_id = "55508ed3-8739-4170-be83-4266754f7ce0"
-
 # ✅ HIER ÄNDERN: Intervall anpassen (Cron Triggers sind auf dem
 # Free-Plan kostenlos, min. Intervall 1 Minute). Alle 15 Minuten ist
 # für Wechselkurse mehr als ausreichend und schont die Free-Limits.

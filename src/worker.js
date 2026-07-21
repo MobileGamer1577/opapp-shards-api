@@ -27,13 +27,23 @@
 //    4. rate_snapshots: ein neuer Datenpunkt (Basis für den späteren
 //       Kursverlauf-Graphen)
 //    5. all_time_high: NUR aktualisieren, wenn der neue Kurs höher
-//       ist als der bisherige Rekord
+//       ist als der bisherige Rekord (siehe Allzeithoch-Fix unten)
 //    6. Items, die in DIESEM Lauf nicht mehr in der API-Antwort
 //       waren, werden auf is_active=0 gesetzt (NICHT gelöscht – so
 //       bleiben Historie & Rekord erhalten, falls ein temporäres
 //       Item später zurückkehrt)
 //    7. Snapshots älter als RETENTION_DAYS werden aufgeräumt
 //       (hält die 5-GB-Free-Grenze von D1 im Blick)
+//
+//  ÄNDERUNGEN (Allzeithoch-Fix):
+//    - Der Rekord-Vergleich lief bisher komplett in SQL (ON CONFLICT
+//      ... DO UPDATE ... WHERE excluded.rate > all_time_high.rate).
+//      Syntaktisch korrekt, aber der Rekord wurde in der Praxis nicht
+//      zuverlässig erhöht. Um das auszuschließen, läuft der Vergleich
+//      jetzt EXPLIZIT in JS: erst per SELECT lesen, dann NUR bei
+//      echtem neuem Rekord schreiben. Etwas mehr Code, aber
+//      unabhängig von SQL-Dialekt-Feinheiten und leicht zu
+//      kontrollieren (z.B. mit `npm run db:ath`).
 //
 //  ENDPUNKTE (nur lesend, GET, öffentlich – keine sensiblen Daten):
 //    GET /shards/ath                        → aktuelle Allzeithochs
@@ -108,19 +118,26 @@ async function pollAndStore(env) {
       ).bind(key, rate, base, now),
     );
 
-    // 3) Allzeithoch NUR aktualisieren, wenn der neue Kurs höher ist
-    //    (oder noch kein Rekord existiert)
-    statements.push(
-      env.DB.prepare(
-        `INSERT INTO all_time_high (item_key, rate, base, achieved_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(item_key) DO UPDATE SET
-           rate = excluded.rate,
-           base = excluded.base,
-           achieved_at = excluded.achieved_at
-         WHERE excluded.rate > all_time_high.rate`,
-      ).bind(key, rate, base, now),
-    );
+    // 3) Allzeithoch – EXPLIZIT per SELECT geprüft (siehe Changelog
+    //    "Allzeithoch-Fix" oben, WARUM nicht mehr rein per SQL-WHERE
+    //    im Upsert). Nur bei echtem neuem Rekord (oder erstem Wert
+    //    überhaupt) wird geschrieben.
+    const existingAth = await env.DB.prepare(
+      `SELECT rate FROM all_time_high WHERE item_key = ?`,
+    ).bind(key).first();
+
+    if (!existingAth || rate > existingAth.rate) {
+      statements.push(
+        env.DB.prepare(
+          `INSERT INTO all_time_high (item_key, rate, base, achieved_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(item_key) DO UPDATE SET
+             rate = excluded.rate,
+             base = excluded.base,
+             achieved_at = excluded.achieved_at`,
+        ).bind(key, rate, base, now),
+      );
+    }
   }
 
   if (statements.length > 0) {
