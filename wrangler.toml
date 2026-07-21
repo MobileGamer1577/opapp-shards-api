@@ -7,7 +7,7 @@ compatibility_date = "2026-07-10"
 [[d1_databases]]
 binding = "DB"
 database_name = "opapp-shards"
-database_id = "039204ba-0956-4053-b21e-a7b042d7596b"
+database_id = "55508ed3-8739-4170-be83-4266754f7ce0"
 # ✅ HIER ÄNDERN: Intervall anpassen (Cron Triggers sind auf dem
 # Free-Plan kostenlos, min. Intervall 1 Minute). Alle 15 Minuten ist
 # für Wechselkurse mehr als ausreichend und schont die Free-Limits.
