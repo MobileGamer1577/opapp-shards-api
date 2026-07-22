@@ -47,7 +47,9 @@
 //
 //  ENDPUNKTE (nur lesend, GET, öffentlich – keine sensiblen Daten):
 //    GET /shards/ath                        → aktuelle Allzeithochs
-//    GET /shards/history/{itemKey}?days=30  → Kursverlauf (für Graph)
+//    GET /shards/history/{itemKey}?days=7|30 → Kursverlauf, serverseitig
+//      aggregiert (stündlich bei ≤7 Tagen, sonst täglich – siehe
+//      Kommentar direkt am Endpunkt unten)
 //    GET /shards/items                      → bekannte Items + Status
 // ═══════════════════════════════════════════════════════════════
 
@@ -208,19 +210,29 @@ async function handleRequest(request, env) {
     return jsonResponse(results, headers);
   }
 
-  // GET /shards/history/{itemKey}?days=30 → Kursverlauf (für künftigen Graph)
+  // GET /shards/history/{itemKey}?days=7|30 → Kursverlauf-Graph (Round 3-Update).
+  // Aggregiert serverseitig, damit die App nicht Tausende Rohpunkte
+  // zeichnen muss: bis 7 Tage stündlich gemittelt (~168 Punkte), darüber
+  // täglich (~30 Punkte bei 30 Tagen). bucketMs per Integer-Division auf
+  // den Zeitstempel angewandt – simpel, ohne SQLite-Datumsfunktionen.
   const historyMatch = url.pathname.match(/^\/shards\/history\/([^/]+)$/);
   if (historyMatch) {
     const itemKey = decodeURIComponent(historyMatch[1]);
     const requestedDays = Number(url.searchParams.get('days') ?? '30');
     const days = Math.min(Math.max(requestedDays || 30, 1), RETENTION_DAYS);
     const since = Date.now() - days * 24 * 60 * 60 * 1000;
+    const bucketMs = days <= 7 ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
 
     const { results } = await env.DB.prepare(
-      `SELECT rate, base, fetched_at FROM rate_snapshots
+      `SELECT
+         (fetched_at / ?) * ? AS fetched_at,
+         AVG(rate) AS rate,
+         AVG(base) AS base
+       FROM rate_snapshots
        WHERE item_key = ? AND fetched_at >= ?
+       GROUP BY fetched_at / ?
        ORDER BY fetched_at ASC`,
-    ).bind(itemKey, since).all();
+    ).bind(bucketMs, bucketMs, itemKey, since, bucketMs).all();
     return jsonResponse(results, headers);
   }
 
