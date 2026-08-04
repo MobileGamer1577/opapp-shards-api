@@ -2,6 +2,8 @@
 //  worker.js – OPAPP Shards-API (Cloudflare Worker + D1)
 //
 //  ✅ HIER ÄNDERN: RETENTION_DAYS unten, Cron-Intervall in wrangler.toml
+//  ✅ HIER ÄNDERN: Fehlermeldungen/Statuscodes in errorResponse() bzw.
+//                  handleHealthCheck() anpassen
 //  ❌ NICHT ÄNDERN: extractItemKey() – MUSS exakt mit
 //                   _extractNbtText() in lib/data/models/shard_rate.dart
 //                   übereinstimmen, sonst laufen App und Worker mit
@@ -45,7 +47,33 @@
 //      unabhängig von SQL-Dialekt-Feinheiten und leicht zu
 //      kontrollieren (z.B. mit `npm run db:ath`).
 //
+//  ÄNDERUNGEN (Monitoring-Update):
+//    - NEU: GET /health – dedizierter Health-Check-Endpunkt für
+//      externe Monitoring-Tools (z.B. Uptime Kuma). Prüft die
+//      einzige echte Abhängigkeit dieser API (D1) mit einer
+//      minimalen Anfrage gegen die items-Tabelle (LIMIT 1). Liefert
+//      HTTP 200 + {"status": "ok", "timestamp": ...}, wenn D1
+//      erreichbar ist, sonst HTTP 503 + {"status": "error",
+//      "message": "..."}.
+//    - FIX: /shards/ath, /shards/history/{itemKey} und /shards/items
+//      liefern bei einem Fehler jetzt einen echten HTTP-Fehlercode
+//      (503 Service Unavailable) statt eines stillen HTTP 200 mit
+//      {"error": "..."} im Body – Monitoring-Tools erkennen einen
+//      Ausfall so zuverlässig am Statuscode statt erst am
+//      JSON-Inhalt.
+//    - Ein ungültig kodierter Item-Key in /shards/history/{itemKey}
+//      (kaputtes %-Encoding) liefert jetzt HTTP 400 statt im
+//      allgemeinen 503-Catch zu landen – das ist ein Client-Fehler,
+//      keine Backend-Störung.
+//    - Die externe OPSUCHT-API (RATES_URL) wird ausschließlich im
+//      Cron-Job abgefragt (pollAndStore) – dort gibt es ohnehin
+//      keine HTTP-Antwort an einen Client, ein Fehlschlag wird
+//      bereits per console.error geloggt. /health prüft deshalb
+//      bewusst NUR D1, die einzige synchrone Abhängigkeit der
+//      lesenden Endpunkte.
+//
 //  ENDPUNKTE (nur lesend, GET, öffentlich – keine sensiblen Daten):
+//    GET /health                             → Health-Check (Monitoring)
 //    GET /shards/ath                        → aktuelle Allzeithochs
 //    GET /shards/history/{itemKey}?days=7|30 → Kursverlauf, serverseitig
 //      aggregiert (stündlich bei ≤7 Tagen, sonst täglich – siehe
@@ -202,54 +230,112 @@ async function handleRequest(request, env) {
     return new Response('Method Not Allowed', { status: 405, headers });
   }
 
-  // GET /shards/ath → Allzeithoch je Item
-  if (url.pathname === '/shards/ath') {
-    const { results } = await env.DB.prepare(
-      `SELECT item_key, rate, base, achieved_at FROM all_time_high ORDER BY item_key`,
-    ).all();
-    return jsonResponse(results, headers);
+  // ✅ NEU (Monitoring-Update): Health-Check VOR dem allgemeinen
+  // try/catch unten, da er seine eigene vollständige Fehlerbehandlung
+  // mitbringt (siehe handleHealthCheck).
+  if (url.pathname === '/health') {
+    return handleHealthCheck(env, headers);
   }
 
-  // GET /shards/history/{itemKey}?days=7|30 → Kursverlauf-Graph (Round 3-Update).
-  // Aggregiert serverseitig, damit die App nicht Tausende Rohpunkte
-  // zeichnen muss: bis 7 Tage stündlich gemittelt (~168 Punkte), darüber
-  // täglich (~30 Punkte bei 30 Tagen). bucketMs per Integer-Division auf
-  // den Zeitstempel angewandt – simpel, ohne SQLite-Datumsfunktionen.
-  const historyMatch = url.pathname.match(/^\/shards\/history\/([^/]+)$/);
-  if (historyMatch) {
-    const itemKey = decodeURIComponent(historyMatch[1]);
-    const requestedDays = Number(url.searchParams.get('days') ?? '30');
-    const days = Math.min(Math.max(requestedDays || 30, 1), RETENTION_DAYS);
-    const since = Date.now() - days * 24 * 60 * 60 * 1000;
-    const bucketMs = days <= 7 ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  try {
+    // GET /shards/ath → Allzeithoch je Item
+    if (url.pathname === '/shards/ath') {
+      const { results } = await env.DB.prepare(
+        `SELECT item_key, rate, base, achieved_at FROM all_time_high ORDER BY item_key`,
+      ).all();
+      return jsonResponse(results, headers);
+    }
 
-    const { results } = await env.DB.prepare(
-      `SELECT
-         (fetched_at / ?) * ? AS fetched_at,
-         AVG(rate) AS rate,
-         AVG(base) AS base
-       FROM rate_snapshots
-       WHERE item_key = ? AND fetched_at >= ?
-       GROUP BY fetched_at / ?
-       ORDER BY fetched_at ASC`,
-    ).bind(bucketMs, bucketMs, itemKey, since, bucketMs).all();
-    return jsonResponse(results, headers);
+    // GET /shards/history/{itemKey}?days=7|30 → Kursverlauf-Graph (Round 3-Update).
+    // Aggregiert serverseitig, damit die App nicht Tausende Rohpunkte
+    // zeichnen muss: bis 7 Tage stündlich gemittelt (~168 Punkte), darüber
+    // täglich (~30 Punkte bei 30 Tagen). bucketMs per Integer-Division auf
+    // den Zeitstempel angewandt – simpel, ohne SQLite-Datumsfunktionen.
+    const historyMatch = url.pathname.match(/^\/shards\/history\/([^/]+)$/);
+    if (historyMatch) {
+      // ✅ NEU (Monitoring-Update): Ungültige URL-Kodierung ist ein
+      // Client-Fehler (HTTP 400), keine Server-/DB-Störung – deshalb
+      // eigener try/catch statt im allgemeinen 503-Catch zu landen.
+      let itemKey;
+      try {
+        itemKey = decodeURIComponent(historyMatch[1]);
+      } catch {
+        return errorResponse(400, 'Ungültiger Item-Key in der URL.', headers);
+      }
+
+      const requestedDays = Number(url.searchParams.get('days') ?? '30');
+      const days = Math.min(Math.max(requestedDays || 30, 1), RETENTION_DAYS);
+      const since = Date.now() - days * 24 * 60 * 60 * 1000;
+      const bucketMs = days <= 7 ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+
+      const { results } = await env.DB.prepare(
+        `SELECT
+           (fetched_at / ?) * ? AS fetched_at,
+           AVG(rate) AS rate,
+           AVG(base) AS base
+         FROM rate_snapshots
+         WHERE item_key = ? AND fetched_at >= ?
+         GROUP BY fetched_at / ?
+         ORDER BY fetched_at ASC`,
+      ).bind(bucketMs, bucketMs, itemKey, since, bucketMs).all();
+      return jsonResponse(results, headers);
+    }
+
+    // GET /shards/items → bekannte Items + Status (v.a. zum Debuggen)
+    if (url.pathname === '/shards/items') {
+      const { results } = await env.DB.prepare(
+        `SELECT item_key, material, is_active, first_seen_at, last_seen_at
+         FROM items ORDER BY item_key`,
+      ).all();
+      return jsonResponse(results, headers);
+    }
+
+    return new Response('Not found', { status: 404, headers });
+  } catch (err) {
+    // ✅ NEU (Monitoring-Update): KEIN HTTP 200 mehr bei einem Fehler –
+    // D1 ist die einzige echte Abhängigkeit dieser drei Endpunkte, ein
+    // Fehler hier bedeutet praktisch immer "Datenbank gerade nicht
+    // erreichbar" → 503 Service Unavailable statt eines stillen 200ers.
+    // Der volle Fehler landet im Log (wrangler tail), der Client
+    // bekommt bewusst nur eine generische Meldung ohne interne Details.
+    console.error('Fehler bei der Anfrage-Verarbeitung:', err);
+    return errorResponse(503, 'Datenbank aktuell nicht erreichbar.', headers);
   }
+}
 
-  // GET /shards/items → bekannte Items + Status (v.a. zum Debuggen)
-  if (url.pathname === '/shards/items') {
-    const { results } = await env.DB.prepare(
-      `SELECT item_key, material, is_active, first_seen_at, last_seen_at
-       FROM items ORDER BY item_key`,
-    ).all();
-    return jsonResponse(results, headers);
+// ─── Health-Check (Monitoring-Update) ───────────────────────────
+// Für Tools wie Uptime Kuma: prüft mit einer minimalen Anfrage gegen
+// die items-Tabelle (LIMIT 1), ob D1 erreichbar UND das Schema
+// vorhanden ist – aussagekräftiger als ein reines "SELECT 1" ohne
+// Tabellenzugriff, aber weiterhin praktisch kostenlos.
+
+async function handleHealthCheck(env, headers) {
+  try {
+    await env.DB.prepare('SELECT 1 FROM items LIMIT 1').first();
+    return new Response(
+      JSON.stringify({ status: 'ok', timestamp: Date.now() }),
+      { status: 200, headers: { ...headers, 'Content-Type': 'application/json' } },
+    );
+  } catch (err) {
+    console.error('Health-Check fehlgeschlagen (D1 nicht erreichbar):', err);
+    return new Response(
+      JSON.stringify({ status: 'error', message: 'Datenbank aktuell nicht erreichbar.' }),
+      { status: 503, headers: { ...headers, 'Content-Type': 'application/json' } },
+    );
   }
-
-  return new Response('Not found', { status: 404, headers });
 }
 
 function jsonResponse(data, headers) {
   return new Response(JSON.stringify(data), {
+    headers: { ...headers, 'Content-Type': 'application/json' },
+  });
+}
+
+// ✅ NEU (Monitoring-Update): Einheitliche Fehler-Antwort mit echtem
+// HTTP-Statuscode – ersetzt das stille "HTTP 200 + {"error": ...}".
+function errorResponse(status, message, headers) {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
     headers: { ...headers, 'Content-Type': 'application/json' },
   });
 }
