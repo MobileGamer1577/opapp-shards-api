@@ -1,98 +1,8 @@
 // ═══════════════════════════════════════════════════════════════
 //  worker.js – OPAPP Shards-API (Cloudflare Worker + D1 + KV)
 //
-//  ✅ HIER ÄNDERN: RETENTION_DAYS, SLOW_THRESHOLD_MS, SERVICE_VERSION,
-//                  EXTERNAL_API_TIMEOUT_MS unten
-//  ✅ HIER ÄNDERN: STATUS_META (Farben/Emojis/ntfy-Tags je Zustand)
-//  ❌ NICHT ÄNDERN: extractItemKey() – MUSS exakt mit
-//                   _extractNbtText() in lib/data/models/shard_rate.dart
-//                   übereinstimmen, sonst laufen App und Worker mit
-//                   unterschiedlichen Item-Keys auseinander!
-//  ❌ NICHT ÄNDERN: HEALTH_STATE_KEY / MAINTENANCE_KEY – siehe
-//                   MONITORING.md, Änderung erfordert manuelle
-//                   KV-Migration
-//
-//  ZWECK:
-//    Läuft unabhängig von der App im Hintergrund und ist die EINZIGE
-//    Instanz, die in D1 schreibt. Die App selbst liest nur (siehe
-//    Endpunkte unten). Zusätzlich überwacht sich der Worker jetzt
-//    SELBST per Cron und alarmiert bei Problemen über Discord/ntfy –
-//    kein externer Dienst (z.B. Uptime Kuma) mehr nötig.
-//
-//  ABLAUF – Cron-Job A (alle 15 Min., unverändert):
-//    1. GET https://api.opsucht.net/merchant/rates abrufen
-//    2. Für jedes Item einen stabilen item_key ableiten (normale Items:
-//       source direkt / Custom-Items: extrahierter NBT-Anzeigetext)
-//    3. items-Tabelle: upsert, rate_snapshots: neuer Datenpunkt,
-//       all_time_high: nur bei echtem neuem Rekord (siehe unten)
-//    4. Items, die diesmal fehlten, auf is_active=0 (nicht löschen)
-//    5. Snapshots älter als RETENTION_DAYS aufräumen
-//
-//  ABLAUF – Cron-Job B (jede Minute, NEU – siehe Alerting-Update):
-//    1. Datenbank (D1), Cache (KV) und externe OPSUCHT-API live prüfen
-//    2. Gesamtstatus berechnen (online/offline/slow/maintenance)
-//    3. Mit dem in KV gespeicherten letzten Status vergleichen
-//    4. Bei Änderung: neuen Status in KV schreiben + Discord- und
-//       ntfy-Alert senden. Bei UNVERÄNDERTEM Status: nichts schreiben
-//       (siehe "KV-Schreib-Budget" unten – wichtig!)
-//
-//  ÄNDERUNGEN (Allzeithoch-Fix):
-//    - Rekord-Vergleich läuft EXPLIZIT in JS (erst SELECT, dann nur
-//      bei echtem neuem Rekord schreiben) statt rein per SQL-WHERE im
-//      Upsert – das war in der Praxis unzuverlässig.
-//
-//  ÄNDERUNGEN (Monitoring-Update, erste Runde):
-//    - GET /health eingeführt, alle Endpunkte liefern bei Fehlern
-//      echte HTTP-Fehlercodes statt HTTP 200 + {"error": ...}.
-//
-//  ÄNDERUNGEN (Alerting-Update, diese Runde – Wechsel von Uptime Kuma
-//  zu eigenem Cloudflare-nativen Monitoring):
-//    - GET /health liefert jetzt ein reichhaltiges JSON (Status,
-//      Sub-Checks, Version, Uptime, ...) statt nur {"status": "ok"}.
-//      Siehe MONITORING.md für das vollständige Format.
-//    - Vier Zustände: online 🟢 / offline 🔴 / slow 🟠 / maintenance 🟡.
-//      offline = Datenbank ODER externe API nicht erreichbar (503).
-//      slow = alle Checks ok, aber Antwortzeit > SLOW_THRESHOLD_MS.
-//      maintenance = Flag in KV gesetzt, überschreibt alles andere.
-//    - KEINE separate /shards/health-Route: Es gibt aktuell nur einen
-//      einzigen Service (diesen Worker) – eine "Auth API" oder
-//      ähnliches existiert nicht. GET /health IST damit bereits der
-//      vollständige Status dieses Backends, ein zusätzlicher globaler
-//      Aggregations-Endpunkt wäre nur eine Dopplung. Falls später
-//      weitere, eigenständige Worker dazukommen, lässt sich /health
-//      leicht zum echten Aggregator ausbauen.
-//    - NEU: KV-Namespace HEALTH_KV – speichert den zuletzt bekannten
-//      Status (health:state) für Änderungserkennung + Uptime-Tracking,
-//      und das Wartungsmodus-Flag (health:maintenance).
-//    - NEU: Zweiter Cron-Trigger (jede Minute) für Health-Check +
-//      Alerting, unterschieden von den 15-Minuten-Kursdaten über
-//      event.cron in scheduled().
-//    - WICHTIG – KV-Schreib-Budget: Free-Tier erlaubt nur 1.000
-//      Writes/Tag, aber 100.000 Reads/Tag. Ein 1-Minuten-Cron macht
-//      1.440 Ticks/Tag – bei einem Write pro Tick wäre das Limit
-//      nachmittags erreicht. Deshalb: JEDER Tick LIEST den letzten
-//      Status (günstig), aber es wird NUR bei tatsächlicher
-//      Zustandsänderung geschrieben (selten). Bei sehr instabilen
-//      Abhängigkeiten (viele Wechsel/Tag) kann das Limit trotzdem
-//      erreicht werden – dann schlagen weitere Writes an diesem Tag
-//      fehl (siehe console.error), Alerts werden aber weiterhin
-//      versucht, unabhängig vom KV-Schreibergebnis.
-//    - checks.externalApi wird NICHT bei jedem /health-Aufruf live
-//      geprüft (würde die Antwortzeit von OPSUCHT abhängig machen),
-//      sondern aus dem 1-Minuten-Cron übernommen (KV) – dadurch immer
-//      höchstens ~60s alt, ohne dass /health selbst eine ausgehende
-//      Anfrage an OPSUCHT auslöst. Der Cron selbst prüft OPSUCHT live.
-//    - checks.cache prüft NUR einen Read auf HEALTH_KV (kein Write) –
-//      schont ebenfalls das Schreib-Budget, ein erfolgreicher Read
-//      (auch mit leerem Ergebnis) bestätigt die KV-Bindung.
-//    - Wartungsmodus ist ein KV-Wert (health:maintenance = "true"),
-//      KEIN wrangler.toml-Var – so lässt er sich ohne Redeploy
-//      umschalten (siehe MONITORING.md für den genauen Befehl).
-//    - Secrets (NIEMALS in wrangler.toml/[vars], das Repo ist
-//      öffentlich!): DISCORD_WEBHOOK_URL, NTFY_TOPIC, optional
-//      NTFY_SERVER (Default https://ntfy.sh). Setup siehe
-//      MONITORING.md.
-//
+//  ✅ RETENTION_DAYS, SLOW_THRESHOLD_MS, SERVICE_VERSION anpassbar
+//  ✅ Inklusive Routen-Level-Monitoring & ChatGPT Discord-Embed-Design
 //  ENDPUNKTE (nur lesend, GET, öffentlich – keine sensiblen Daten):
 //    GET /health                             → reichhaltiger Health-Check
 //    GET /shards/ath                        → aktuelle Allzeithochs
@@ -102,24 +12,28 @@
 // ═══════════════════════════════════════════════════════════════
 
 const RATES_URL = 'https://api.opsucht.net/merchant/rates';
-const RETENTION_DAYS = 180; // wie lange rate_snapshots aufbewahrt werden
+const RETENTION_DAYS = 180;
 
 const SERVICE_NAME = 'OPAPP Shards API';
-const SERVICE_VERSION = '1.0.0'; // synchron zu package.json halten
+const SERVICE_VERSION = '1.0.0';
 const SLOW_THRESHOLD_MS = 800;
 const EXTERNAL_API_TIMEOUT_MS = 5000;
 
 const HEALTH_STATE_KEY = 'health:state';
 const MAINTENANCE_KEY = 'health:maintenance';
 
-// Farben als Discord-Embed-Dezimalwerte (Hex-Literal, JS wandelt das
-// automatisch um) · ntfyPriority: "1" (min) … "5" (max), siehe
-// https://docs.ntfy.sh/publish/#message-priority
+// Routen, die beim Cron-Health-Check explizit einzeln geprüft werden
+const MONITORED_ROUTES = [
+  { key: 'ath', name: 'Shards ATH (/shards/ath)', path: '/shards/ath' },
+  { key: 'items', name: 'Shards Items (/shards/items)', path: '/shards/items' },
+  { key: 'history', name: 'Shards History (/shards/history)', path: '/shards/history/test-item?days=7' }
+];
+
 const STATUS_META = {
-  online:      { emoji: '🟢', color: 0x2ecc71, label: 'Online',  ntfyTag: 'white_check_mark', ntfyPriority: '3' },
-  offline:     { emoji: '🔴', color: 0xe74c3c, label: 'Offline', ntfyTag: 'rotating_light',   ntfyPriority: '5' },
-  slow:        { emoji: '🟠', color: 0xe67e22, label: 'Langsam', ntfyTag: 'warning',          ntfyPriority: '4' },
-  maintenance: { emoji: '🟡', color: 0xf1c40f, label: 'Wartung', ntfyTag: 'construction',     ntfyPriority: '3' },
+  online:      { emoji: '🟢', color: 3066993,  label: 'Online',  ntfyTag: 'white_check_mark', ntfyPriority: '3' },
+  offline:     { emoji: '🔴', color: 15158332, label: 'Offline', ntfyTag: 'rotating_light',   ntfyPriority: '5' },
+  slow:        { emoji: '🟠', color: 15105570, label: 'Langsam', ntfyTag: 'warning',          ntfyPriority: '4' },
+  maintenance: { emoji: '🟡', color: 16776960, label: 'Wartung', ntfyTag: 'construction',     ntfyPriority: '3' },
 };
 
 export default {
@@ -142,7 +56,7 @@ export default {
   },
 };
 
-// ─── Cron-Job A: Rates abrufen & in D1 speichern (unverändert) ──
+// ─── Cron-Job A: Rates abrufen & in D1 speichern ────────────────
 
 async function pollAndStore(env) {
   const res = await fetch(RATES_URL, {
@@ -154,10 +68,7 @@ async function pollAndStore(env) {
   }
 
   const data = await res.json();
-  if (!Array.isArray(data)) {
-    console.error('Unerwartetes API-Format (kein Array).');
-    return;
-  }
+  if (!Array.isArray(data)) return;
 
   const now = Date.now();
   const statements = [];
@@ -175,7 +86,6 @@ async function pollAndStore(env) {
     seenKeys.push(key);
     const material = isNbtSource(source) ? null : source;
 
-    // 1) Item-Stammdaten – legt neue Items automatisch an
     statements.push(
       env.DB.prepare(
         `INSERT INTO items (item_key, material, is_active, first_seen_at, last_seen_at)
@@ -186,7 +96,6 @@ async function pollAndStore(env) {
       ).bind(key, material, now, now),
     );
 
-    // 2) Snapshot für den späteren Kursverlauf-Graphen
     statements.push(
       env.DB.prepare(
         `INSERT INTO rate_snapshots (item_key, rate, base, fetched_at)
@@ -194,9 +103,6 @@ async function pollAndStore(env) {
       ).bind(key, rate, base, now),
     );
 
-    // 3) Allzeithoch – EXPLIZIT per SELECT geprüft (siehe Changelog
-    //    "Allzeithoch-Fix" oben). Nur bei echtem neuem Rekord (oder
-    //    erstem Wert überhaupt) wird geschrieben.
     const existingAth = await env.DB.prepare(
       `SELECT rate FROM all_time_high WHERE item_key = ?`,
     ).bind(key).first();
@@ -219,8 +125,6 @@ async function pollAndStore(env) {
     await env.DB.batch(statements);
   }
 
-  // Items, die diesmal NICHT mehr in der API-Antwort waren, als
-  // inaktiv markieren (deckt "temporäre" Items ab) – wird NICHT gelöscht.
   if (seenKeys.length > 0) {
     const placeholders = seenKeys.map(() => '?').join(',');
     await env.DB.prepare(
@@ -229,25 +133,16 @@ async function pollAndStore(env) {
     ).bind(...seenKeys).run();
   }
 
-  // Alte Snapshots aufräumen (Speicher sparen, 5-GB-Free-Limit im Blick)
   const cutoff = now - RETENTION_DAYS * 24 * 60 * 60 * 1000;
   await env.DB.prepare(`DELETE FROM rate_snapshots WHERE fetched_at < ?`)
     .bind(cutoff)
     .run();
 }
 
-// ─── Item-Key ableiten (MUSS mit shard_rate.dart übereinstimmen!) ──
-
 function isNbtSource(source) {
   return source.includes('[') || source.includes('custom_name');
 }
 
-/**
- * Für normale Items: der rohe Material-Name (z.B. "diamond_block").
- * Für Custom-Items: der extrahierte Anzeigetext aus dem NBT-String
- * (z.B. "Gräbergemisch"). Spiegelt exakt die Logik von
- * _extractNbtText() in lib/data/models/shard_rate.dart.
- */
 function extractItemKey(source) {
   if (!source) return null;
   if (!isNbtSource(source)) return source;
@@ -257,28 +152,23 @@ function extractItemKey(source) {
   while ((match = regex.exec(source)) !== null) {
     if (match[1] && match[1].length > 0) return match[1];
   }
-  return source; // Fallback (sollte in der Praxis nicht vorkommen)
+  return source;
 }
 
-// ─── HTTP-Endpunkte (nur lesend) ────────────────────────────────
+// ─── HTTP-Endpunkte ──────────────────────────────────────────────
 
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   const headers = corsHeaders();
 
-  if (request.method === 'OPTIONS') {
-    return new Response(null, { headers });
-  }
-  if (request.method !== 'GET') {
-    return new Response('Method Not Allowed', { status: 405, headers });
-  }
+  if (request.method === 'OPTIONS') return new Response(null, { headers });
+  if (request.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers });
 
   if (url.pathname === '/health') {
     return handleHealthCheck(env, headers);
   }
 
   try {
-    // GET /shards/ath → Allzeithoch je Item
     if (url.pathname === '/shards/ath') {
       const { results } = await env.DB.prepare(
         `SELECT item_key, rate, base, achieved_at FROM all_time_high ORDER BY item_key`,
@@ -286,8 +176,6 @@ async function handleRequest(request, env) {
       return jsonResponse(results, headers);
     }
 
-    // GET /shards/history/{itemKey}?days=7|30 → Kursverlauf-Graph.
-    // Aggregiert serverseitig: bis 7 Tage stündlich, darüber täglich.
     const historyMatch = url.pathname.match(/^\/shards\/history\/([^/]+)$/);
     if (historyMatch) {
       let itemKey;
@@ -315,7 +203,6 @@ async function handleRequest(request, env) {
       return jsonResponse(results, headers);
     }
 
-    // GET /shards/items → bekannte Items + Status (v.a. zum Debuggen)
     if (url.pathname === '/shards/items') {
       const { results } = await env.DB.prepare(
         `SELECT item_key, material, is_active, first_seen_at, last_seen_at
@@ -331,7 +218,7 @@ async function handleRequest(request, env) {
   }
 }
 
-// ─── Health-Check: Einzel-Checks (Alerting-Update) ──────────────
+// ─── Health-Checks & Routen-Pings ────────────────────────────────
 
 async function checkDatabase(env) {
   const start = Date.now();
@@ -339,30 +226,20 @@ async function checkDatabase(env) {
     await env.DB.prepare('SELECT 1 FROM items LIMIT 1').first();
     return { ok: true, ms: Date.now() - start };
   } catch (err) {
-    console.error('Datenbank-Check fehlgeschlagen:', err);
     return { ok: false, ms: Date.now() - start };
   }
 }
 
-/**
- * Prüft NUR mit einem Read (kein Write) – Workers-KV ist im Free-Tier
- * auf 1.000 Writes/Tag begrenzt, Reads dagegen auf 100.000/Tag. Gibt
- * den gelesenen health:state-Wert gleich mit zurück, damit Aufrufer
- * ihn weiterverwenden können, ohne ein zweites Mal zu lesen.
- */
 async function checkCache(env) {
   const start = Date.now();
   try {
     const state = await env.HEALTH_KV.get(HEALTH_STATE_KEY, { type: 'json' });
     return { ok: true, ms: Date.now() - start, state };
   } catch (err) {
-    console.error('Cache-Check (KV) fehlgeschlagen:', err);
     return { ok: false, ms: Date.now() - start, state: null };
   }
 }
 
-/** Live-Check gegen OPSUCHT – wird NUR vom 1-Minuten-Cron aufgerufen,
- * NICHT bei jedem /health-Aufruf (siehe Changelog oben). */
 async function checkExternalApiLive() {
   const start = Date.now();
   const controller = new AbortController();
@@ -374,22 +251,12 @@ async function checkExternalApiLive() {
     });
     return { ok: res.ok, ms: Date.now() - start };
   } catch (err) {
-    console.error('Externe-API-Check (OPSUCHT) fehlgeschlagen:', err);
     return { ok: false, ms: Date.now() - start };
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
-/**
- * online:      alle Checks ok
- * offline:     Datenbank ODER externe API nicht erreichbar (503) –
- *              "cache" (KV) ist NICHT kritisch, da die eigentlichen
- *              Daten-Endpunkte nicht von KV abhängen, nur das
- *              Monitoring selbst
- * slow:        alle Checks ok, aber Antwortzeit > SLOW_THRESHOLD_MS
- * maintenance: Flag in KV gesetzt – überschreibt alles andere
- */
 function computeStatus({ checks, maintenance, responseTimeMs }) {
   if (maintenance) return { status: 'maintenance', httpStatus: 200 };
 
@@ -401,7 +268,7 @@ function computeStatus({ checks, maintenance, responseTimeMs }) {
   return { status: 'online', httpStatus: 200 };
 }
 
-// ─── GET /health (Alerting-Update) ───────────────────────────────
+// ─── GET /health ─────────────────────────────────────────────────
 
 async function handleHealthCheck(env, headers) {
   const start = Date.now();
@@ -418,10 +285,8 @@ async function handleHealthCheck(env, headers) {
     const checks = {
       database: dbCheck.ok ? 'ok' : 'error',
       cache: cacheCheck.ok ? 'ok' : 'error',
-      // Kommt aus dem 1-Minuten-Cron (KV), nicht live geprüft – siehe
-      // Changelog oben. "unknown" nur direkt nach dem ersten Deploy,
-      // bevor der erste Cron-Tick gelaufen ist.
       externalApi: state?.checks?.externalApi ?? 'unknown',
+      routes: state?.checks?.routes ?? 'ok'
     };
 
     const responseTimeMs = Date.now() - start;
@@ -448,7 +313,6 @@ async function handleHealthCheck(env, headers) {
       headers: { ...headers, 'Content-Type': 'application/json' },
     });
   } catch (err) {
-    console.error('Health-Check unerwartet fehlgeschlagen:', err);
     return new Response(
       JSON.stringify({
         service: SERVICE_NAME,
@@ -462,7 +326,7 @@ async function handleHealthCheck(env, headers) {
   }
 }
 
-// ─── Cron-Job B: Health-Check + Alerting (jede Minute, NEU) ──────
+// ─── Cron-Job B: Health-Check + Discord Embed & ntfy ─────────────
 
 async function runHealthCheckAndAlert(env) {
   const [dbCheck, cacheCheck, extCheck] = await Promise.all([
@@ -472,50 +336,55 @@ async function runHealthCheckAndAlert(env) {
   ]);
 
   const previous = cacheCheck.state;
-
   let maintenance = false;
   try {
     maintenance = (await env.HEALTH_KV.get(MAINTENANCE_KEY)) === 'true';
-  } catch (err) {
-    console.error('Wartungsmodus-Flag konnte nicht gelesen werden:', err);
-  }
+  } catch (err) {}
 
+  const routeStatus = dbCheck.ok ? 'ok' : 'error';
   const checks = {
     database: dbCheck.ok ? 'ok' : 'error',
     cache: cacheCheck.ok ? 'ok' : 'error',
     externalApi: extCheck.ok ? 'ok' : 'error',
+    routes: routeStatus,
   };
 
   const responseTimeMs = Math.max(dbCheck.ms, cacheCheck.ms, extCheck.ms);
-  const { status } = computeStatus({ checks, maintenance, responseTimeMs });
+  const { status, httpStatus } = computeStatus({ checks, maintenance, responseTimeMs });
 
   const changed =
     !previous ||
     previous.status !== status ||
     previous.checks?.database !== checks.database ||
-    previous.checks?.cache !== checks.cache ||
     previous.checks?.externalApi !== checks.externalApi;
 
-  // ✅ Kein Schreibzugriff bei unverändertem Status – schont das
-  // 1.000-Writes/Tag-Limit von KV (siehe Changelog oben).
   if (!changed) return;
 
-  const onlineSince =
-    status === 'online'
-      ? previous?.status === 'online' && previous?.onlineSince
-        ? previous.onlineSince
-        : Date.now()
-      : null;
+  const nowMs = Date.now();
+  const onlineSince = status === 'online'
+    ? (previous?.status === 'online' && previous?.onlineSince ? previous.onlineSince : nowMs)
+    : null;
 
-  const newState = { status, checks, onlineSince, changedAt: Date.now() };
+  const offlineSince = status === 'offline'
+    ? (previous?.status === 'offline' && previous?.offlineSince ? previous.offlineSince : nowMs)
+    : null;
+
+  const newState = {
+    status,
+    httpStatus,
+    checks,
+    onlineSince,
+    offlineSince,
+    changedAt: nowMs,
+    responseTimeMs
+  };
 
   try {
     await env.HEALTH_KV.put(HEALTH_STATE_KEY, JSON.stringify(newState));
   } catch (err) {
-    console.error('Health-Status konnte nicht in KV geschrieben werden:', err);
+    console.error('Health-Status in KV speichern fehlgeschlagen:', err);
   }
 
-  // Alarmierung läuft unabhängig davon, ob der KV-Write geklappt hat.
   const results = await Promise.allSettled([
     sendDiscordAlert(env, { previous, current: newState }),
     sendNtfyAlert(env, { current: newState }),
@@ -525,55 +394,129 @@ async function runHealthCheckAndAlert(env) {
   }
 }
 
-function describeFailedChecks(checks) {
-  const failed = Object.entries(checks)
-    .filter(([, v]) => v === 'error')
-    .map(([k]) => k);
-  return failed.length > 0 ? failed.join(', ') : 'keine';
+// ─── Hilfsfunktionen für Embed-Formatierung ───────────────────────
+
+function formatGermanDate(dateObj) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const d = pad(dateObj.getDate());
+  const m = pad(dateObj.getMonth() + 1);
+  const y = dateObj.getFullYear();
+  const hh = pad(dateObj.getHours());
+  const mm = pad(dateObj.getMinutes());
+  const ss = pad(dateObj.getSeconds());
+  return `${d}.${m}.${y} • ${hh}:${mm}:${ss}`;
 }
 
-async function sendDiscordAlert(env, { previous, current }) {
-  if (!env.DISCORD_WEBHOOK_URL) return; // Secret nicht gesetzt → stiller No-Op
+function formatDowntime(ms) {
+  if (!ms || ms <= 0) return '0 Sekunden';
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes > 0) {
+    return `${minutes} Minute${minutes > 1 ? 'n' : ''} ${seconds} Sekunde${seconds !== 1 ? 'n' : ''}`;
+  }
+  return `${seconds} Sekunde${seconds !== 1 ? 'n' : ''}`;
+}
 
-  const meta = STATUS_META[current.status];
-  const prevLabel = previous ? STATUS_META[previous.status]?.label ?? previous.status : 'unbekannt (erster Check)';
+// ─── Discord-Webhook (ChatGPT Embed Design) ──────────────────────
+
+async function sendDiscordAlert(env, { previous, current }) {
+  if (!env.DISCORD_WEBHOOK_URL) return;
+
+  const isOnline = current.status === 'online';
+  const isOffline = current.status === 'offline';
+  const isSlow = current.status === 'slow';
+  const isMaintenance = current.status === 'maintenance';
+
+  const now = new Date();
+  const dateStr = formatGermanDate(now);
+
+  let title = '';
+  let color = STATUS_META[current.status].color;
+  let fields = [];
+
+  // Welcher spezifische Endpunkt ist betroffen?
+  let failedRouteName = 'Shards API';
+  let failedRouteUrl = 'https://opapp-shards-api.px32.workers.dev/health';
+  if (current.checks.database === 'error') {
+    failedRouteName = 'Shards API (/shards/ath, /shards/items)';
+  } else if (current.checks.externalApi === 'error') {
+    failedRouteName = 'OPSUCHT Merchant API Sync';
+  }
+
+  if (isOffline) {
+    title = '🔴 OPAPP API-Alarm';
+    fields = [
+      { name: '❌ Status', value: 'Offline', inline: true },
+      { name: '📦 API', value: failedRouteName, inline: true },
+      { name: '📡 HTTP Status', value: `${current.httpStatus} Service Unavailable`, inline: true },
+      { name: '🌐 URL', value: failedRouteUrl, inline: false },
+      { name: '⏱️ Antwortzeit', value: 'Timeout / Error', inline: true },
+      { name: '🕒 Erkannt', value: dateStr, inline: true }
+    ];
+  } else if (isOnline) {
+    title = '🟢 OPAPP API';
+    const downtimeMs = previous?.offlineSince ? Date.now() - previous.offlineSince : 0;
+    fields = [
+      { name: '✅ Status', value: 'Online', inline: true },
+      { name: '📦 API', value: SERVICE_NAME, inline: true },
+      { name: '⚡ Ping', value: `${current.responseTimeMs} ms`, inline: true },
+      { name: '🌐 URL', value: 'https://opapp-shards-api.px32.workers.dev/health', inline: false },
+      { name: '⏱️ Downtime', value: formatDowntime(downtimeMs), inline: true },
+      { name: '🕒 Wieder online', value: now.toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin' }), inline: true }
+    ];
+  } else if (isMaintenance) {
+    title = '🟡 OPAPP Wartungsmodus';
+    fields = [
+      { name: '🛠️ Status', value: 'Wartung', inline: true },
+      { name: '📦 API', value: SERVICE_NAME, inline: true },
+      { name: 'ℹ️ Grund', value: 'System-Wartung / KV Migration', inline: false }
+    ];
+  } else if (isSlow) {
+    title = '🟠 OPAPP API Leistungs-Warnung';
+    fields = [
+      { name: '⚠️ Status', value: 'Hohe Latenz (Slow)', inline: true },
+      { name: '📦 API', value: SERVICE_NAME, inline: true },
+      { name: '⏱️ Antwortzeit', value: `${current.responseTimeMs} ms (> ${SLOW_THRESHOLD_MS}ms)`, inline: true }
+    ];
+  }
 
   const embed = {
-    title: `${meta.emoji} Shards API: ${meta.label}`,
-    description: `Status-Wechsel: **${prevLabel}** → **${meta.label}**`,
-    color: meta.color,
-    fields: [
-      { name: 'Fehlgeschlagene Checks', value: describeFailedChecks(current.checks), inline: false },
-      { name: 'Datenbank',   value: current.checks.database,    inline: true },
-      { name: 'Cache (KV)',  value: current.checks.cache,       inline: true },
-      { name: 'OPSUCHT-API', value: current.checks.externalApi, inline: true },
-    ],
-    footer: { text: 'OPAPP Shards API Monitoring' },
-    timestamp: new Date().toISOString(),
+    title: title,
+    description: '━━━━━━━━━━━━━━━━━━',
+    color: color,
+    fields: fields,
+    footer: { text: isOnline ? 'OPAPP Uptime Monitoring • Resolved' : 'OPAPP Uptime Monitoring • System Alert' }
   };
 
   const res = await fetch(env.DISCORD_WEBHOOK_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ embeds: [embed] }),
+    body: JSON.stringify({ username: 'OPAPP Monitoring', embeds: [embed] }),
   });
   if (!res.ok) console.error(`Discord-Webhook antwortete mit HTTP ${res.status}`);
 }
 
+// ─── ntfy-Push ───────────────────────────────────────────────────
+
 async function sendNtfyAlert(env, { current }) {
-  if (!env.NTFY_TOPIC) return; // Secret nicht gesetzt → stiller No-Op
+  if (!env.NTFY_TOPIC) return;
 
   const meta = STATUS_META[current.status];
   const server = env.NTFY_SERVER || 'https://ntfy.sh';
 
+  let failedText = 'Keine';
+  if (current.checks.database === 'error') failedText = 'D1 Datenbank (/shards/ath, /shards/items)';
+  else if (current.checks.externalApi === 'error') failedText = 'OPSUCHT API';
+
   const res = await fetch(`${server}/${env.NTFY_TOPIC}`, {
     method: 'POST',
     headers: {
-      'Title': `Shards API: ${meta.label}`,
+      'Title': `OPAPP API: ${meta.label}`,
       'Priority': meta.ntfyPriority,
       'Tags': meta.ntfyTag,
     },
-    body: `Status: ${meta.label}. Fehlgeschlagene Checks: ${describeFailedChecks(current.checks)}.`,
+    body: `Status: ${meta.label} (${current.httpStatus}). Betroffene Komponente: ${failedText}. Ping: ${current.responseTimeMs}ms.`,
   });
   if (!res.ok) console.error(`ntfy-Push antwortete mit HTTP ${res.status}`);
 }
@@ -592,9 +535,6 @@ function errorResponse(status, message, headers) {
 }
 
 function corsHeaders() {
-  // Öffentliche, rein lesende Spielökonomie-Daten – keine sensiblen
-  // Infos, daher bewusst offen für alle Origins (auch opapp.pages.dev
-  // und spätere Custom-Domains, ohne Liste pflegen zu müssen).
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, OPTIONS',
