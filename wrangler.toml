@@ -8,8 +8,28 @@ compatibility_date = "2026-07-10"
 binding = "DB"
 database_name = "opapp-shards"
 database_id = "55508ed3-8739-4170-be83-4266754f7ce0"
-# ✅ HIER ÄNDERN: Intervall anpassen (Cron Triggers sind auf dem
-# Free-Plan kostenlos, min. Intervall 1 Minute). Alle 15 Minuten ist
-# für Wechselkurse mehr als ausreichend und schont die Free-Limits.
+
+# ✅ HIER ÄNDERN: id nach "npx wrangler kv namespace create HEALTH_KV"
+# hier eintragen (siehe MONITORING.md, Schritt 1). Speichert den
+# zuletzt bekannten Health-Status (health:state, für Alerting bei
+# Zustandswechseln + Uptime-Tracking) und das Wartungsmodus-Flag
+# (health:maintenance).
+[[kv_namespaces]]
+binding = "HEALTH_KV"
+id = "c10bed6d25b643ad9d4e69ff5719b568"
+
+# ✅ HIER ÄNDERN: Intervalle anpassen (Cron Triggers sind auf dem
+# Free-Plan kostenlos, min. Intervall 1 Minute). Zwei Einträge, in
+# scheduled() über event.cron unterschieden:
+#   */15 * * * *  → pollAndStore()           – Kursdaten (unverändert)
+#   *    * * * *  → runHealthCheckAndAlert()  – Health-Check + Alerting (NEU)
 [triggers]
-crons = ["*/15 * * * *"]
+crons = ["*/15 * * * *", "* * * * *"]
+
+# ❌ NICHT HIER EINTRAGEN: DISCORD_WEBHOOK_URL, NTFY_TOPIC, NTFY_SERVER.
+# Diese Datei ist Teil des öffentlichen Repos – Secrets gehören NICHT
+# in [vars]. Stattdessen einmalig lokal setzen (siehe MONITORING.md,
+# Schritt 2):
+#   npx wrangler secret put DISCORD_WEBHOOK_URL
+#   npx wrangler secret put NTFY_TOPIC
+#   npx wrangler secret put NTFY_SERVER      (optional, Default https://ntfy.sh)
