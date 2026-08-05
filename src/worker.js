@@ -1,6 +1,8 @@
 // ═══════════════════════════════════════════════════════════════
 //  worker.js – OPAPP Shards-API (Cloudflare Worker + D1 + KV)
-//
+//  
+//  ✅ Discord-Fields strikt untereinander (inline: false für PC & Handy)
+//  ✅ Routen-Monitoring für /shards/ath, /shards/items & /shards/history
 //  ✅ RETENTION_DAYS, SLOW_THRESHOLD_MS, SERVICE_VERSION anpassbar
 //  ✅ Inklusive Routen-Level-Monitoring & ChatGPT Discord-Embed-Design
 //  ENDPUNKTE (nur lesend, GET, öffentlich – keine sensiblen Daten):
@@ -21,13 +23,6 @@ const EXTERNAL_API_TIMEOUT_MS = 5000;
 
 const HEALTH_STATE_KEY = 'health:state';
 const MAINTENANCE_KEY = 'health:maintenance';
-
-// Routen, die beim Cron-Health-Check explizit einzeln geprüft werden
-const MONITORED_ROUTES = [
-  { key: 'ath', name: 'Shards ATH (/shards/ath)', path: '/shards/ath' },
-  { key: 'items', name: 'Shards Items (/shards/items)', path: '/shards/items' },
-  { key: 'history', name: 'Shards History (/shards/history)', path: '/shards/history/test-item?days=7' }
-];
 
 const STATUS_META = {
   online:      { emoji: '🟢', color: 3066993,  label: 'Online',  ntfyTag: 'white_check_mark', ntfyPriority: '3' },
@@ -218,7 +213,7 @@ async function handleRequest(request, env) {
   }
 }
 
-// ─── Health-Checks & Routen-Pings ────────────────────────────────
+// ─── Health-Checks & Routen-Tests ───────────────────────────────
 
 async function checkDatabase(env) {
   const start = Date.now();
@@ -257,10 +252,33 @@ async function checkExternalApiLive() {
   }
 }
 
+// Prüft gezielt alle einzelnen API-Routen durch interne Requests
+async function checkAllRoutes(env) {
+  const routesToTest = [
+    { name: 'Shards ATH (/shards/ath)', path: '/shards/ath' },
+    { name: 'Shards Items (/shards/items)', path: '/shards/items' },
+    { name: 'Shards History (/shards/history)', path: '/shards/history/test?days=7' }
+  ];
+
+  for (const route of routesToTest) {
+    try {
+      const mockReq = new Request(`https://internal-check.local${route.path}`);
+      const res = await handleRequest(mockReq, env);
+      if (res.status >= 400) {
+        return { ok: false, failedRoute: route.name, status: res.status };
+      }
+    } catch (err) {
+      return { ok: false, failedRoute: route.name, status: 500 };
+    }
+  }
+
+  return { ok: true, failedRoute: null };
+}
+
 function computeStatus({ checks, maintenance, responseTimeMs }) {
   if (maintenance) return { status: 'maintenance', httpStatus: 200 };
 
-  const criticalFailure = checks.database === 'error' || checks.externalApi === 'error';
+  const criticalFailure = checks.database === 'error' || checks.externalApi === 'error' || checks.routes === 'error';
   if (criticalFailure) return { status: 'offline', httpStatus: 503 };
 
   if (responseTimeMs > SLOW_THRESHOLD_MS) return { status: 'slow', httpStatus: 200 };
@@ -273,9 +291,10 @@ function computeStatus({ checks, maintenance, responseTimeMs }) {
 async function handleHealthCheck(env, headers) {
   const start = Date.now();
   try {
-    const [dbCheck, cacheCheck, maintenanceFlag] = await Promise.all([
+    const [dbCheck, cacheCheck, routeCheck, maintenanceFlag] = await Promise.all([
       checkDatabase(env),
       checkCache(env),
+      checkAllRoutes(env),
       env.HEALTH_KV.get(MAINTENANCE_KEY).catch(() => null),
     ]);
 
@@ -286,7 +305,8 @@ async function handleHealthCheck(env, headers) {
       database: dbCheck.ok ? 'ok' : 'error',
       cache: cacheCheck.ok ? 'ok' : 'error',
       externalApi: state?.checks?.externalApi ?? 'unknown',
-      routes: state?.checks?.routes ?? 'ok'
+      routes: routeCheck.ok ? 'ok' : 'error',
+      failedRouteName: routeCheck.failedRoute
     };
 
     const responseTimeMs = Date.now() - start;
@@ -326,13 +346,14 @@ async function handleHealthCheck(env, headers) {
   }
 }
 
-// ─── Cron-Job B: Health-Check + Discord Embed & ntfy ─────────────
+// ─── Cron-Job B: Monitoring & Alerts ─────────────────────────────
 
 async function runHealthCheckAndAlert(env) {
-  const [dbCheck, cacheCheck, extCheck] = await Promise.all([
+  const [dbCheck, cacheCheck, extCheck, routeCheck] = await Promise.all([
     checkDatabase(env),
     checkCache(env),
     checkExternalApiLive(),
+    checkAllRoutes(env),
   ]);
 
   const previous = cacheCheck.state;
@@ -341,12 +362,12 @@ async function runHealthCheckAndAlert(env) {
     maintenance = (await env.HEALTH_KV.get(MAINTENANCE_KEY)) === 'true';
   } catch (err) {}
 
-  const routeStatus = dbCheck.ok ? 'ok' : 'error';
   const checks = {
     database: dbCheck.ok ? 'ok' : 'error',
     cache: cacheCheck.ok ? 'ok' : 'error',
     externalApi: extCheck.ok ? 'ok' : 'error',
-    routes: routeStatus,
+    routes: routeCheck.ok ? 'ok' : 'error',
+    failedRouteName: routeCheck.failedRoute,
   };
 
   const responseTimeMs = Math.max(dbCheck.ms, cacheCheck.ms, extCheck.ms);
@@ -356,7 +377,8 @@ async function runHealthCheckAndAlert(env) {
     !previous ||
     previous.status !== status ||
     previous.checks?.database !== checks.database ||
-    previous.checks?.externalApi !== checks.externalApi;
+    previous.checks?.externalApi !== checks.externalApi ||
+    previous.checks?.routes !== checks.routes;
 
   if (!changed) return;
 
@@ -418,7 +440,7 @@ function formatDowntime(ms) {
   return `${seconds} Sekunde${seconds !== 1 ? 'n' : ''}`;
 }
 
-// ─── Discord-Webhook (ChatGPT Embed Design) ──────────────────────
+// ─── Discord-Webhook (Alle Fields auf inline: false gesetzt) ──────
 
 async function sendDiscordAlert(env, { previous, current }) {
   if (!env.DISCORD_WEBHOOK_URL) return;
@@ -435,49 +457,50 @@ async function sendDiscordAlert(env, { previous, current }) {
   let color = STATUS_META[current.status].color;
   let fields = [];
 
-  // Welcher spezifische Endpunkt ist betroffen?
-  let failedRouteName = 'Shards API';
-  let failedRouteUrl = 'https://opapp-shards-api.px32.workers.dev/health';
-  if (current.checks.database === 'error') {
-    failedRouteName = 'Shards API (/shards/ath, /shards/items)';
+  // Ermitteln, welche API-Komponente genau ausgefallen ist
+  let affectedApiName = SERVICE_NAME;
+  if (current.checks.routes === 'error' && current.checks.failedRouteName) {
+    affectedApiName = current.checks.failedRouteName;
+  } else if (current.checks.database === 'error') {
+    affectedApiName = 'D1 Datenbank (/shards/*)';
   } else if (current.checks.externalApi === 'error') {
-    failedRouteName = 'OPSUCHT Merchant API Sync';
+    affectedApiName = 'OPSUCHT Merchant API Sync';
   }
 
   if (isOffline) {
     title = '🔴 OPAPP API-Alarm';
     fields = [
-      { name: '❌ Status', value: 'Offline', inline: true },
-      { name: '📦 API', value: failedRouteName, inline: true },
-      { name: '📡 HTTP Status', value: `${current.httpStatus} Service Unavailable`, inline: true },
-      { name: '🌐 URL', value: failedRouteUrl, inline: false },
-      { name: '⏱️ Antwortzeit', value: 'Timeout / Error', inline: true },
-      { name: '🕒 Erkannt', value: dateStr, inline: true }
+      { name: '❌ Status', value: 'Offline', inline: false },
+      { name: '📦 API', value: affectedApiName, inline: false },
+      { name: '📡 HTTP Status', value: `${current.httpStatus} Service Unavailable`, inline: false },
+      { name: '🌐 URL', value: 'https://opapp-shards-api.px32.workers.dev/health', inline: false },
+      { name: '⏱️ Antwortzeit', value: 'Timeout / Error', inline: false },
+      { name: '🕒 Erkannt', value: dateStr, inline: false }
     ];
   } else if (isOnline) {
     title = '🟢 OPAPP API';
     const downtimeMs = previous?.offlineSince ? Date.now() - previous.offlineSince : 0;
     fields = [
-      { name: '✅ Status', value: 'Online', inline: true },
-      { name: '📦 API', value: SERVICE_NAME, inline: true },
-      { name: '⚡ Ping', value: `${current.responseTimeMs} ms`, inline: true },
+      { name: '✅ Status', value: 'Online', inline: false },
+      { name: '📦 API', value: SERVICE_NAME, inline: false },
+      { name: '⚡ Ping', value: `${current.responseTimeMs} ms`, inline: false },
       { name: '🌐 URL', value: 'https://opapp-shards-api.px32.workers.dev/health', inline: false },
-      { name: '⏱️ Downtime', value: formatDowntime(downtimeMs), inline: true },
-      { name: '🕒 Wieder online', value: now.toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin' }), inline: true }
+      { name: '⏱️ Downtime', value: formatDowntime(downtimeMs), inline: false },
+      { name: '🕒 Wieder online', value: now.toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin' }), inline: false }
     ];
   } else if (isMaintenance) {
     title = '🟡 OPAPP Wartungsmodus';
     fields = [
-      { name: '🛠️ Status', value: 'Wartung', inline: true },
-      { name: '📦 API', value: SERVICE_NAME, inline: true },
+      { name: '🛠️ Status', value: 'Wartung', inline: false },
+      { name: '📦 API', value: SERVICE_NAME, inline: false },
       { name: 'ℹ️ Grund', value: 'System-Wartung / KV Migration', inline: false }
     ];
   } else if (isSlow) {
     title = '🟠 OPAPP API Leistungs-Warnung';
     fields = [
-      { name: '⚠️ Status', value: 'Hohe Latenz (Slow)', inline: true },
-      { name: '📦 API', value: SERVICE_NAME, inline: true },
-      { name: '⏱️ Antwortzeit', value: `${current.responseTimeMs} ms (> ${SLOW_THRESHOLD_MS}ms)`, inline: true }
+      { name: '⚠️ Status', value: 'Hohe Latenz (Slow)', inline: false },
+      { name: '📦 API', value: SERVICE_NAME, inline: false },
+      { name: '⏱️ Antwortzeit', value: `${current.responseTimeMs} ms (> ${SLOW_THRESHOLD_MS}ms)`, inline: false }
     ];
   }
 
@@ -506,8 +529,13 @@ async function sendNtfyAlert(env, { current }) {
   const server = env.NTFY_SERVER || 'https://ntfy.sh';
 
   let failedText = 'Keine';
-  if (current.checks.database === 'error') failedText = 'D1 Datenbank (/shards/ath, /shards/items)';
-  else if (current.checks.externalApi === 'error') failedText = 'OPSUCHT API';
+  if (current.checks.routes === 'error' && current.checks.failedRouteName) {
+    failedText = current.checks.failedRouteName;
+  } else if (current.checks.database === 'error') {
+    failedText = 'D1 Datenbank';
+  } else if (current.checks.externalApi === 'error') {
+    failedText = 'OPSUCHT API Sync';
+  }
 
   const res = await fetch(`${server}/${env.NTFY_TOPIC}`, {
     method: 'POST',
@@ -516,7 +544,7 @@ async function sendNtfyAlert(env, { current }) {
       'Priority': meta.ntfyPriority,
       'Tags': meta.ntfyTag,
     },
-    body: `Status: ${meta.label} (${current.httpStatus}). Betroffene Komponente: ${failedText}. Ping: ${current.responseTimeMs}ms.`,
+    body: `Status: ${meta.label} (${current.httpStatus}). Betroffen: ${failedText}. Ping: ${current.responseTimeMs}ms.`,
   });
   if (!res.ok) console.error(`ntfy-Push antwortete mit HTTP ${res.status}`);
 }
