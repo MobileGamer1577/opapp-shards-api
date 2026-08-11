@@ -1,7 +1,10 @@
-# Monitoring & Alerting – opapp-shards-api
+# Monitoring & Alerting – opapp-api
 
 Eigenständiges Cloudflare-natives Monitoring (Cron Trigger + KV + Discord/ntfy),
 ersetzt den früheren Uptime-Kuma-Ansatz. Kein externer Dienst mehr nötig.
+
+> ✅ Umbenannt (Server-Status-Update): "opapp-shards-api" → "opapp-api",
+> siehe Deploy-Hinweis in `wrangler.toml`.
 
 ## 1. Einmalige Einrichtung
 
@@ -38,23 +41,25 @@ npx wrangler deploy
 
 Ab dem ersten Cron-Tick (max. 1 Minute nach Deploy) füllt sich `health:state`
 in KV, danach zeigt `GET /health` den echten `externalApi`-Status statt `"unknown"`.
+Im selben 1-Minuten-Tick läuft ab jetzt auch `pollPlayerPeak()` mit (siehe Punkt 6).
 
 ## 2. `/health`-Format
 
 ```json
 {
-  "service": "OPAPP Shards API",
+  "service": "OPAPP API",
   "status": "online",
   "httpStatus": 200,
   "responseTimeMs": 12,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "maintenance": false,
-  "timestamp": "2026-08-05T15:02:14.000Z",
+  "timestamp": "2026-08-10T15:02:14.000Z",
   "uptimeSeconds": 86400,
   "checks": {
     "database": "ok",
     "cache": "ok",
-    "externalApi": "ok"
+    "externalApi": "ok",
+    "routes": "ok"
   }
 }
 ```
@@ -65,11 +70,12 @@ in KV, danach zeigt `GET /health` den echten `externalApi`-Status statt `"unknow
 | `checks.database` | D1 – kritisch, löst bei `"error"` `offline` aus |
 | `checks.cache` | HEALTH_KV – informativ, löst NICHT `offline` aus (nur das Monitoring selbst hängt daran, nicht die Daten-Endpunkte) |
 | `checks.externalApi` | OPSUCHT-API – kritisch, löst bei `"error"` `offline` aus. Kommt aus dem 1-Minuten-Cron (max. ~60s alt), nicht live bei jedem Aufruf geprüft. Zeigt `"unknown"`, bis der erste Cron-Tick gelaufen ist |
+| `checks.routes` | Testet /shards/ath, /shards/items, /shards/history UND /server/peak durch interne Requests |
 | `uptimeSeconds` | Sekunden seit dem letzten Wechsel zu `online` (Workers haben keinen langlebigen Prozess – "Uptime" ist hier eine Ableitung aus dem gespeicherten Status, kein OS-Wert) |
 
 **Status-Logik:**
 - `maintenance` (Flag in KV gesetzt) überschreibt alles andere → HTTP 200
-- `database` oder `externalApi` = `error` → `offline` → HTTP 503
+- `database`, `externalApi` oder `routes` = `error` → `offline` → HTTP 503
 - alle Checks ok, aber `responseTimeMs` > 800ms (`SLOW_THRESHOLD_MS` in `worker.js`) → `slow` → HTTP 200
 - sonst → `online` → HTTP 200
 
@@ -86,9 +92,9 @@ npx wrangler kv key put --binding=HEALTH_KV "health:maintenance" "false"
 Wirkt sofort, ohne Redeploy. Beim nächsten Cron-Tick (max. 1 Minute) geht außerdem
 ein Discord/ntfy-Alert für den Wechsel zu bzw. aus `maintenance` raus.
 
-## 4. Wie das Alerting funktiont
+## 4. Wie das Alerting funktioniert
 
-- Cron läuft jede Minute, prüft Datenbank + Cache + externe API.
+- Cron läuft jede Minute, prüft Datenbank + Cache + externe API + Routen.
 - Ergebnis wird mit dem letzten in KV gespeicherten Status verglichen.
 - **Nur bei tatsächlicher Änderung** (Status oder einzelner Check kippt) wird
   a) der neue Status in KV geschrieben und b) ein Discord-Embed + ein
@@ -112,3 +118,17 @@ ein Discord/ntfy-Alert für den Wechsel zu bzw. aus `maintenance` raus.
   OPSUCHTs Antwortzeit abhängt.
 - Es gibt nur einen Service (diesen Worker) – `/health` ist bereits der
   vollständige Status, kein separater globaler Aggregations-Endpunkt nötig.
+
+## 6. Spieler-Rekord (`/server/peak`, Server-Status-Update)
+
+- `pollPlayerPeak()` läuft im selben 1-Minuten-Cron-Tick wie der Health-Check
+  mit (kein eigener Cron-Trigger), fragt `PLAYER_STATUS_URL` (mc-api.io,
+  `bc4.opsucht.iwmedia.ovh`) ab und vergleicht `onlinePlayers` gegen den in
+  `player_count_peak` gespeicherten Rekord.
+- Geschrieben wird in D1 **nur bei einem neuen Rekord** (SELECT-then-compare
+  in JS, kein WHERE-conditional Upsert – gleiches Prinzip wie bei
+  `all_time_high`, siehe Kommentar in `worker.js`) – D1-Schreiblast bleibt
+  dadurch minimal, unabhängig von der Cron-Frequenz.
+- Fehlschläge (mc-api.io nicht erreichbar, Timeout nach 5s) werden geloggt,
+  lösen aber **keinen** Alert und **keinen** `offline`-Status aus – der
+  Spieler-Rekord ist ein informatives Extra, kein kritischer Service-Check.

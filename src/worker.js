@@ -1,8 +1,9 @@
 // ═══════════════════════════════════════════════════════════════
-//  worker.js – OPAPP Shards-API (Cloudflare Worker + D1 + KV)
-//  
+//  worker.js – OPAPP API (Cloudflare Worker + D1 + KV)
+//
 //  ✅ Discord-Fields strikt untereinander (inline: false für PC & Handy)
-//  ✅ Routen-Monitoring für /shards/ath, /shards/items & /shards/history
+//  ✅ Routen-Monitoring für /shards/ath, /shards/items, /shards/history
+//     & /server/peak
 //  ✅ RETENTION_DAYS, SLOW_THRESHOLD_MS, SERVICE_VERSION anpassbar
 //  ✅ Inklusive Routen-Level-Monitoring & ChatGPT Discord-Embed-Design
 //  ENDPUNKTE (nur lesend, GET, öffentlich – keine sensiblen Daten):
@@ -11,13 +12,30 @@
 //    GET /shards/history/{itemKey}?days=7|30 → Kursverlauf, serverseitig
 //      aggregiert (stündlich bei ≤7 Tagen, sonst täglich)
 //    GET /shards/items                      → bekannte Items + Status
+//    GET /server/peak                       → Spieler-Rekord (höchste je
+//      gemessene Online-Spielerzahl + Datum) – NEU, Server-Status-Update
+//
+//  ✅ UMBENANNT (Server-Status-Update): "opapp-shards-api" → "opapp-api",
+//  da der Worker jetzt mehr als nur die OPShard-Kurse abdeckt. Beim
+//  Deployen dieser Umbenennung unbedingt die Reihenfolge aus dem
+//  Kommentar in wrangler.toml beachten (alten Worker erst NACH
+//  erfolgreichem Redeploy löschen, sonst doppelte Cron-Ticks auf
+//  derselben D1-Datenbank)!
 // ═══════════════════════════════════════════════════════════════
 
 const RATES_URL = 'https://api.opsucht.net/merchant/rates';
 const RETENTION_DAYS = 180;
 
-const SERVICE_NAME = 'OPAPP Shards API';
-const SERVICE_VERSION = '1.0.0';
+// ✅ NEU (Server-Status-Update): Live-Serverstatus für den Spieler-
+// Rekord. Bewusst "bc4.opsucht.iwmedia.ovh" statt "opsucht.net" (auf
+// Wunsch) – siehe auch ApiConstants.serverStatusUrl in der Flutter-App,
+// die dieselbe Adresse für die Live-Anzeige verwendet (dort wird direkt
+// gegen mc-api.io gefetcht, nicht über diesen Worker – hier läuft nur
+// die Rekord-Erfassung).
+const PLAYER_STATUS_URL = 'https://mc-api.io/server/java/bc4.opsucht.iwmedia.ovh';
+
+const SERVICE_NAME = 'OPAPP API';
+const SERVICE_VERSION = '1.1.0';
 const SLOW_THRESHOLD_MS = 800;
 const EXTERNAL_API_TIMEOUT_MS = 5000;
 
@@ -42,8 +60,15 @@ export default {
         pollAndStore(env).catch((err) => console.error('Cron-Lauf (Kursdaten) fehlgeschlagen:', err)),
       );
     } else if (event.cron === '* * * * *') {
+      // ✅ NEU (Server-Status-Update): pollPlayerPeak() läuft im selben
+      // 1-Minuten-Tick wie der Health-Check mit – kein dritter Cron-
+      // Trigger nötig. Beide unabhängig voneinander (ein Fehler im
+      // einen blockiert den anderen nicht).
       ctx.waitUntil(
-        runHealthCheckAndAlert(env).catch((err) => console.error('Cron-Lauf (Health-Check) fehlgeschlagen:', err)),
+        Promise.all([
+          runHealthCheckAndAlert(env).catch((err) => console.error('Cron-Lauf (Health-Check) fehlgeschlagen:', err)),
+          pollPlayerPeak(env).catch((err) => console.error('Cron-Lauf (Spieler-Rekord) fehlgeschlagen:', err)),
+        ]),
       );
     } else {
       console.error(`Unbekannter Cron-Trigger: ${event.cron}`);
@@ -150,6 +175,48 @@ function extractItemKey(source) {
   return source;
 }
 
+// ─── Cron-Job B (Teil 2): Spieler-Rekord pollen & bei neuem Rekord
+// in D1 speichern (Server-Status-Update) ─────────────────────────
+//
+// ❌ WICHTIG: Bewusst SELECT-then-compare in JS statt eines WHERE-
+// conditional Upserts – letzteres ist mit D1 unzuverlässig (siehe
+// gleiches Muster schon in pollAndStore() für all_time_high oben).
+
+async function pollPlayerPeak(env) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), EXTERNAL_API_TIMEOUT_MS);
+  try {
+    const res = await fetch(PLAYER_STATUS_URL, {
+      headers: { Accept: 'application/json', 'User-Agent': 'OPAPP-Worker/1.0' },
+      signal: controller.signal,
+    });
+    if (!res.ok) return;
+
+    const data = await res.json();
+    const count = Number(data.onlinePlayers);
+    if (!Number.isFinite(count)) return;
+
+    const existing = await env.DB.prepare(
+      `SELECT player_count FROM player_count_peak WHERE id = 1`,
+    ).first();
+
+    if (!existing || count > existing.player_count) {
+      const now = Date.now();
+      await env.DB.prepare(
+        `INSERT INTO player_count_peak (id, player_count, achieved_at)
+         VALUES (1, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           player_count = excluded.player_count,
+           achieved_at = excluded.achieved_at`,
+      ).bind(count, now).run();
+    }
+  } catch (err) {
+    console.error('Spieler-Rekord-Check fehlgeschlagen:', err);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 // ─── HTTP-Endpunkte ──────────────────────────────────────────────
 
 async function handleRequest(request, env) {
@@ -206,6 +273,24 @@ async function handleRequest(request, env) {
       return jsonResponse(results, headers);
     }
 
+    // ✅ NEU (Server-Status-Update): Spieler-Rekord. Noch keine Zeile
+    // vorhanden (z.B. direkt nach Deploy/Migration, bevor der erste
+    // Cron-Tick lief)? → playerCount/achievedAt bewusst null statt
+    // Fehler, App zeigt dann "Noch keine Daten" (siehe ServerPeak in
+    // der Flutter-App).
+    if (url.pathname === '/server/peak') {
+      const row = await env.DB.prepare(
+        `SELECT player_count, achieved_at FROM player_count_peak WHERE id = 1`,
+      ).first();
+      if (!row) {
+        return jsonResponse({ playerCount: null, achievedAt: null }, headers);
+      }
+      return jsonResponse(
+        { playerCount: row.player_count, achievedAt: row.achieved_at },
+        headers,
+      );
+    }
+
     return new Response('Not found', { status: 404, headers });
   } catch (err) {
     console.error('Fehler bei der Anfrage-Verarbeitung:', err);
@@ -257,7 +342,8 @@ async function checkAllRoutes(env) {
   const routesToTest = [
     { name: 'Shards ATH (/shards/ath)', path: '/shards/ath' },
     { name: 'Shards Items (/shards/items)', path: '/shards/items' },
-    { name: 'Shards History (/shards/history)', path: '/shards/history/test?days=7' }
+    { name: 'Shards History (/shards/history)', path: '/shards/history/test?days=7' },
+    { name: 'Server Peak (/server/peak)', path: '/server/peak' },
   ];
 
   for (const route of routesToTest) {
@@ -346,7 +432,7 @@ async function handleHealthCheck(env, headers) {
   }
 }
 
-// ─── Cron-Job B: Monitoring & Alerts ─────────────────────────────
+// ─── Cron-Job B (Teil 1): Monitoring & Alerts ────────────────────
 
 async function runHealthCheckAndAlert(env) {
   const [dbCheck, cacheCheck, extCheck, routeCheck] = await Promise.all([
@@ -462,7 +548,7 @@ async function sendDiscordAlert(env, { previous, current }) {
   if (current.checks.routes === 'error' && current.checks.failedRouteName) {
     affectedApiName = current.checks.failedRouteName;
   } else if (current.checks.database === 'error') {
-    affectedApiName = 'D1 Datenbank (/shards/*)';
+    affectedApiName = 'D1 Datenbank (/shards/*, /server/*)';
   } else if (current.checks.externalApi === 'error') {
     affectedApiName = 'OPSUCHT Merchant API Sync';
   }
@@ -473,7 +559,7 @@ async function sendDiscordAlert(env, { previous, current }) {
       { name: '❌ Status', value: 'Offline', inline: false },
       { name: '📦 API', value: affectedApiName, inline: false },
       { name: '📡 HTTP Status', value: `${current.httpStatus} Service Unavailable`, inline: false },
-      { name: '🌐 URL', value: 'https://opapp-shards-api.px32.workers.dev/health', inline: false },
+      { name: '🌐 URL', value: 'https://opapp-api.px32.workers.dev/health', inline: false },
       { name: '⏱️ Antwortzeit', value: 'Timeout / Error', inline: false },
       { name: '🕒 Erkannt', value: dateStr, inline: false }
     ];
@@ -484,7 +570,7 @@ async function sendDiscordAlert(env, { previous, current }) {
       { name: '✅ Status', value: 'Online', inline: false },
       { name: '📦 API', value: SERVICE_NAME, inline: false },
       { name: '⚡ Ping', value: `${current.responseTimeMs} ms`, inline: false },
-      { name: '🌐 URL', value: 'https://opapp-shards-api.px32.workers.dev/health', inline: false },
+      { name: '🌐 URL', value: 'https://opapp-api.px32.workers.dev/health', inline: false },
       { name: '⏱️ Downtime', value: formatDowntime(downtimeMs), inline: false },
       { name: '🕒 Wieder online', value: now.toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin' }), inline: false }
     ];

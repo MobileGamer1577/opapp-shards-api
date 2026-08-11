@@ -1,9 +1,30 @@
-name = "opapp-shards-api"
+# ✅ UMBENANNT (Server-Status-Update): von "opapp-shards-api" zu
+# "opapp-api" – der Worker deckt inzwischen mehr als nur die OPShard-
+# Wechselkurse ab (Server-Spieler-Rekord kam über /server/peak dazu),
+# der alte Name war nicht mehr treffend.
+#
+# ⚠️ WICHTIG BEIM DEPLOYEN DIESER ÄNDERUNG (einmalig):
+# Ein Worker-Rename in wrangler.toml erzeugt beim nächsten
+# "npx wrangler deploy" einen NEUEN Worker unter der neuen
+# *.workers.dev-Subdomain (opapp-api.px32.workers.dev) – der alte
+# Worker (opapp-shards-api.px32.workers.dev) läuft parallel WEITER,
+# inklusive seiner eigenen Cron-Trigger! Reihenfolge daher:
+#   1. Diese Datei deployen: npx wrangler deploy
+#   2. Prüfen, dass https://opapp-api.px32.workers.dev/health antwortet
+#   3. Den alten Worker löschen: npx wrangler delete --name opapp-shards-api
+#      (sonst schreiben beide Worker parallel in dieselbe D1-Datenbank
+#      und pollen beide bei OPSUCHT/mc-api.io – doppelte Last + doppelte
+#      Cron-Ticks!)
+#   4. In der Flutter-App ist die neue URL bereits hinterlegt (siehe
+#      api_constants.dart) – ab Schritt 3 sofort synchron.
+name = "opapp-api"
 main = "src/worker.js"
 compatibility_date = "2026-07-10"
 
 # ✅ HIER ÄNDERN: database_id nach "wrangler d1 create opapp-shards"
 # (siehe DEPLOY_STEPS.md, Schritt 3) hier eintragen.
+# Bewusst NICHT mit umbenannt (nur der Worker-Name ändert sich) – ein
+# D1-Rename ist riskanter/aufwändiger als der Nutzen hier rechtfertigt.
 [[d1_databases]]
 binding = "DB"
 database_name = "opapp-shards"
@@ -21,8 +42,11 @@ id = "c10bed6d25b643ad9d4e69ff5719b568"
 # ✅ HIER ÄNDERN: Intervalle anpassen (Cron Triggers sind auf dem
 # Free-Plan kostenlos, min. Intervall 1 Minute). Zwei Einträge, in
 # scheduled() über event.cron unterschieden:
-#   */15 * * * *  → pollAndStore()           – Kursdaten (unverändert)
-#   *    * * * *  → runHealthCheckAndAlert()  – Health-Check + Alerting (NEU)
+#   */15 * * * *  → pollAndStore()            – Kursdaten (unverändert)
+#   *    * * * *  → runHealthCheckAndAlert()   – Health-Check + Alerting
+#                   UND pollPlayerPeak()        – Spieler-Rekord (NEU,
+#                   läuft im selben 1-Minuten-Tick mit, kein dritter
+#                   Cron-Trigger nötig)
 [triggers]
 crons = ["*/15 * * * *", "* * * * *"]
 
