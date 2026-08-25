@@ -2,8 +2,8 @@
 //  worker.js – OPAPP API (Cloudflare Worker + D1 + KV)
 //
 //  ✅ Discord-Fields strikt untereinander (inline: false für PC & Handy)
-//  ✅ Routen-Monitoring für /shards/ath, /shards/items, /shards/history
-//     & /server/peak
+//  ✅ Routen-Monitoring für /shards/ath, /shards/items, /shards/history,
+//     /server/peak & /server/peak/today
 //  ✅ RETENTION_DAYS, SLOW_THRESHOLD_MS, SERVICE_VERSION anpassbar
 //  ✅ Inklusive Routen-Level-Monitoring & ChatGPT Discord-Embed-Design
 //  ENDPUNKTE (nur lesend, GET, öffentlich – keine sensiblen Daten):
@@ -13,7 +13,10 @@
 //      aggregiert (stündlich bei ≤7 Tagen, sonst täglich)
 //    GET /shards/items                      → bekannte Items + Status
 //    GET /server/peak                       → Spieler-Rekord (höchste je
-//      gemessene Online-Spielerzahl + Datum) – NEU, Server-Status-Update
+//      gemessene Online-Spielerzahl + Datum) – Server-Status-Update
+//    GET /server/peak/today                 → höchste Online-Spielerzahl
+//      HEUTE (Kalendertag Europe/Berlin) + Zeitpunkt – NEU,
+//      Server-Info-Update
 //
 //  ✅ UMBENANNT (Server-Status-Update): "opapp-shards-api" → "opapp-api",
 //  da der Worker jetzt mehr als nur die OPShard-Kurse abdeckt. Beim
@@ -21,6 +24,12 @@
 //  Kommentar in wrangler.toml beachten (alten Worker erst NACH
 //  erfolgreichem Redeploy löschen, sonst doppelte Cron-Ticks auf
 //  derselben D1-Datenbank)!
+//
+//  ⚠️ DEPLOY-REIHENFOLGE (Server-Info-Update): Vor diesem Deploy zuerst
+//  migrations/0004_daily_peak.sql remote ausführen (npm run
+//  db:migrate-daily-peak) – sonst schlägt updateDailyPeak() im Cron mit
+//  einem SQL-Fehler fehl (wird nur geloggt, Tages-Peak bliebe bis zur
+//  Migration leer, kein harter Crash für den Rest des Workers).
 // ═══════════════════════════════════════════════════════════════
 
 const RATES_URL = 'https://api.opsucht.net/merchant/rates';
@@ -60,10 +69,12 @@ export default {
         pollAndStore(env).catch((err) => console.error('Cron-Lauf (Kursdaten) fehlgeschlagen:', err)),
       );
     } else if (event.cron === '* * * * *') {
-      // ✅ NEU (Server-Status-Update): pollPlayerPeak() läuft im selben
-      // 1-Minuten-Tick wie der Health-Check mit – kein dritter Cron-
-      // Trigger nötig. Beide unabhängig voneinander (ein Fehler im
-      // einen blockiert den anderen nicht).
+      // ✅ pollPlayerPeak() läuft im selben 1-Minuten-Tick wie der
+      // Health-Check mit – kein dritter Cron-Trigger nötig. Beide
+      // unabhängig voneinander (ein Fehler im einen blockiert den
+      // anderen nicht). Seit dem Server-Info-Update pflegt
+      // pollPlayerPeak() aus EINEM Fetch sowohl den All-Time-Rekord
+      // als auch den Tages-Peak.
       ctx.waitUntil(
         Promise.all([
           runHealthCheckAndAlert(env).catch((err) => console.error('Cron-Lauf (Health-Check) fehlgeschlagen:', err)),
@@ -175,33 +186,54 @@ function extractItemKey(source) {
   return source;
 }
 
-// ─── Cron-Job B (Teil 2): Spieler-Rekord pollen & bei neuem Rekord
-// in D1 speichern (Server-Status-Update) ─────────────────────────
+// ─── Cron-Job B (Teil 2): Spieler-Rekord (All-Time + Heute) pollen &
+// bei neuem Rekord in D1 speichern (Server-Status-Update, erweitert im
+// Server-Info-Update um den Tages-Peak) ──────────────────────────────
 //
 // ❌ WICHTIG: Bewusst SELECT-then-compare in JS statt eines WHERE-
 // conditional Upserts – letzteres ist mit D1 unzuverlässig (siehe
 // gleiches Muster schon in pollAndStore() für all_time_high oben).
+//
+// ✅ NEU (Server-Info-Update): EIN Fetch pro Cron-Tick wird jetzt für
+// ZWEI Aktualisierungen genutzt (All-Time-Rekord UND Tages-Peak) –
+// vorher gab es hier nur den All-Time-Teil. Kein zusätzlicher Request
+// an mc-api.io nötig, dadurch keine höhere Last auf der externen API.
 
 async function pollPlayerPeak(env) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), EXTERNAL_API_TIMEOUT_MS);
+  let data;
   try {
     const res = await fetch(PLAYER_STATUS_URL, {
       headers: { Accept: 'application/json', 'User-Agent': 'OPAPP-Worker/1.0' },
       signal: controller.signal,
     });
     if (!res.ok) return;
+    data = await res.json();
+  } catch (err) {
+    console.error('Spieler-Rekord-Check fehlgeschlagen:', err);
+    return;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
-    const data = await res.json();
-    const count = Number(data.onlinePlayers);
-    if (!Number.isFinite(count)) return;
+  const count = Number(data.onlinePlayers);
+  if (!Number.isFinite(count)) return;
+  const now = Date.now();
 
+  await Promise.all([
+    updateAllTimePeak(env, count, now),
+    updateDailyPeak(env, count, now),
+  ]);
+}
+
+async function updateAllTimePeak(env, count, now) {
+  try {
     const existing = await env.DB.prepare(
       `SELECT player_count FROM player_count_peak WHERE id = 1`,
     ).first();
 
     if (!existing || count > existing.player_count) {
-      const now = Date.now();
       await env.DB.prepare(
         `INSERT INTO player_count_peak (id, player_count, achieved_at)
          VALUES (1, ?, ?)
@@ -211,10 +243,54 @@ async function pollPlayerPeak(env) {
       ).bind(count, now).run();
     }
   } catch (err) {
-    console.error('Spieler-Rekord-Check fehlgeschlagen:', err);
-  } finally {
-    clearTimeout(timeoutId);
+    console.error('All-Time-Rekord-Update fehlgeschlagen:', err);
   }
+}
+
+// ✅ NEU (Server-Info-Update): Tages-Peak, Tagesgrenze = Europe/Berlin
+// Mitternacht (inkl. Sommer-/Winterzeit, siehe berlinDateString()
+// unten). Eine Zeile PRO KALENDERTAG (daily_peak, siehe migrations/
+// 0004_daily_peak.sql) – kein Retention-Cleanup nötig, das wächst nur
+// um ~365 Zeilen/Jahr. Eigener try/catch, damit ein Fehler hier NICHT
+// auch updateAllTimePeak() betrifft (Promise.all oben liefe sonst als
+// Ganzes auf reject, obwohl der All-Time-Teil erfolgreich war).
+async function updateDailyPeak(env, count, now) {
+  try {
+    const today = berlinDateString(now);
+
+    const existing = await env.DB.prepare(
+      `SELECT player_count FROM daily_peak WHERE date = ?`,
+    ).bind(today).first();
+
+    if (!existing || count > existing.player_count) {
+      await env.DB.prepare(
+        `INSERT INTO daily_peak (date, player_count, achieved_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(date) DO UPDATE SET
+           player_count = excluded.player_count,
+           achieved_at = excluded.achieved_at`,
+      ).bind(today, count, now).run();
+    }
+  } catch (err) {
+    console.error('Tages-Peak-Update fehlgeschlagen:', err);
+  }
+}
+
+// Kalendertag (YYYY-MM-DD) in Europe/Berlin für einen Unix-Millisekunden-
+// Zeitstempel. Nutzt Intl.DateTimeFormat.formatToParts() statt sich auf
+// ein bestimmtes Locale-Ausgabeformat (z.B. "en-CA" → YYYY-MM-DD) zu
+// verlassen – so bleibt das Ergebnis stabil, egal wie sich Intl-Locale-
+// Defaults künftig verhalten. Berücksichtigt Sommer-/Winterzeit
+// automatisch über die in workerd integrierte IANA-Zeitzonendatenbank.
+function berlinDateString(timestampMs) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Europe/Berlin',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date(timestampMs));
+  const map = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  return `${map.year}-${map.month}-${map.day}`;
 }
 
 // ─── HTTP-Endpunkte ──────────────────────────────────────────────
@@ -273,15 +349,35 @@ async function handleRequest(request, env) {
       return jsonResponse(results, headers);
     }
 
-    // ✅ NEU (Server-Status-Update): Spieler-Rekord. Noch keine Zeile
-    // vorhanden (z.B. direkt nach Deploy/Migration, bevor der erste
-    // Cron-Tick lief)? → playerCount/achievedAt bewusst null statt
-    // Fehler, App zeigt dann "Noch keine Daten" (siehe ServerPeak in
-    // der Flutter-App).
+    // Spieler-Rekord (All-Time). Noch keine Zeile vorhanden (z.B.
+    // direkt nach Deploy/Migration, bevor der erste Cron-Tick lief)? →
+    // playerCount/achievedAt bewusst null statt Fehler, App zeigt dann
+    // "Noch keine Daten" (siehe ServerPeak in der Flutter-App).
     if (url.pathname === '/server/peak') {
       const row = await env.DB.prepare(
         `SELECT player_count, achieved_at FROM player_count_peak WHERE id = 1`,
       ).first();
+      if (!row) {
+        return jsonResponse({ playerCount: null, achievedAt: null }, headers);
+      }
+      return jsonResponse(
+        { playerCount: row.player_count, achievedAt: row.achieved_at },
+        headers,
+      );
+    }
+
+    // ✅ NEU (Server-Info-Update): Tages-Peak (höchste Online-Spieler-
+    // zahl seit Mitternacht Europe/Berlin). Noch keine Zeile für heute
+    // (z.B. kurz nach Mitternacht, bevor der erste Cron-Tick lief, oder
+    // direkt nach der Migration)? → playerCount/achievedAt bewusst
+    // null, gleiches Fallback-Prinzip wie /server/peak oben – GENAU
+    // dasselbe JSON-Format, ServerPeak.fromJson in der Flutter-App
+    // deckt beide Endpunkte ab.
+    if (url.pathname === '/server/peak/today') {
+      const today = berlinDateString(Date.now());
+      const row = await env.DB.prepare(
+        `SELECT player_count, achieved_at FROM daily_peak WHERE date = ?`,
+      ).bind(today).first();
       if (!row) {
         return jsonResponse({ playerCount: null, achievedAt: null }, headers);
       }
@@ -344,6 +440,8 @@ async function checkAllRoutes(env) {
     { name: 'Shards Items (/shards/items)', path: '/shards/items' },
     { name: 'Shards History (/shards/history)', path: '/shards/history/test?days=7' },
     { name: 'Server Peak (/server/peak)', path: '/server/peak' },
+    // ✅ NEU (Server-Info-Update)
+    { name: 'Server Peak Today (/server/peak/today)', path: '/server/peak/today' },
   ];
 
   for (const route of routesToTest) {

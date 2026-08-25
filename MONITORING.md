@@ -70,7 +70,7 @@ Im selben 1-Minuten-Tick läuft ab jetzt auch `pollPlayerPeak()` mit (siehe Punk
 | `checks.database` | D1 – kritisch, löst bei `"error"` `offline` aus |
 | `checks.cache` | HEALTH_KV – informativ, löst NICHT `offline` aus (nur das Monitoring selbst hängt daran, nicht die Daten-Endpunkte) |
 | `checks.externalApi` | OPSUCHT-API – kritisch, löst bei `"error"` `offline` aus. Kommt aus dem 1-Minuten-Cron (max. ~60s alt), nicht live bei jedem Aufruf geprüft. Zeigt `"unknown"`, bis der erste Cron-Tick gelaufen ist |
-| `checks.routes` | Testet /shards/ath, /shards/items, /shards/history UND /server/peak durch interne Requests |
+| `checks.routes` | Testet /shards/ath, /shards/items, /shards/history, /server/peak UND /server/peak/today durch interne Requests |
 | `uptimeSeconds` | Sekunden seit dem letzten Wechsel zu `online` (Workers haben keinen langlebigen Prozess – "Uptime" ist hier eine Ableitung aus dem gespeicherten Status, kein OS-Wert) |
 
 **Status-Logik:**
@@ -119,16 +119,28 @@ ein Discord/ntfy-Alert für den Wechsel zu bzw. aus `maintenance` raus.
 - Es gibt nur einen Service (diesen Worker) – `/health` ist bereits der
   vollständige Status, kein separater globaler Aggregations-Endpunkt nötig.
 
-## 6. Spieler-Rekord (`/server/peak`, Server-Status-Update)
+## 6. Spieler-Rekord & Tages-Peak (`/server/peak`, `/server/peak/today`)
 
 - `pollPlayerPeak()` läuft im selben 1-Minuten-Cron-Tick wie der Health-Check
   mit (kein eigener Cron-Trigger), fragt `PLAYER_STATUS_URL` (mc-api.io,
-  `bc4.opsucht.iwmedia.ovh`) ab und vergleicht `onlinePlayers` gegen den in
-  `player_count_peak` gespeicherten Rekord.
-- Geschrieben wird in D1 **nur bei einem neuen Rekord** (SELECT-then-compare
-  in JS, kein WHERE-conditional Upsert – gleiches Prinzip wie bei
+  `bc4.opsucht.iwmedia.ovh`) EINMAL ab und aktualisiert daraus zwei getrennte
+  Werte:
+  - **All-Time-Rekord** (`player_count_peak`, `GET /server/peak`) – höchste je
+    gemessene Online-Spielerzahl + Datum.
+  - **Tages-Peak** (`daily_peak`, `GET /server/peak/today`, ✅ NEU im
+    Server-Info-Update) – höchste Online-Spielerzahl seit Mitternacht
+    **Europe/Berlin** (inkl. Sommer-/Winterzeit, siehe `berlinDateString()`
+    in `worker.js`), **NICHT UTC**. Eine Zeile pro Kalendertag, kein
+    Retention-Cleanup nötig (max. ~365 Zeilen/Jahr).
+  - Beide Werte werden aus DEMSELBEN Fetch aktualisiert – kein zweiter
+    Request an mc-api.io pro Cron-Tick.
+- Geschrieben wird in D1 jeweils **nur bei einem neuen Rekord** (SELECT-then-
+  compare in JS, kein WHERE-conditional Upsert – gleiches Prinzip wie bei
   `all_time_high`, siehe Kommentar in `worker.js`) – D1-Schreiblast bleibt
   dadurch minimal, unabhängig von der Cron-Frequenz.
 - Fehlschläge (mc-api.io nicht erreichbar, Timeout nach 5s) werden geloggt,
   lösen aber **keinen** Alert und **keinen** `offline`-Status aus – der
   Spieler-Rekord ist ein informatives Extra, kein kritischer Service-Check.
+- ⚠️ Vor dem ersten Deploy nach dem Server-Info-Update: `npm run
+  db:migrate-daily-peak` ausführen, sonst schlägt `updateDailyPeak()` mit
+  einem SQL-Fehler fehl (wird nur geloggt, betrifft NICHT den All-Time-Teil).
