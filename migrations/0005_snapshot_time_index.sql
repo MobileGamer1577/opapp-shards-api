@@ -1,0 +1,37 @@
+-- ═══════════════════════════════════════════════════════════════
+--  0005_snapshot_time_index.sql – Index auf rate_snapshots(fetched_at)
+--
+--  ✅ HIER ÄNDERN: nichts nötig – läuft einmalig remote (siehe
+--                  npm run db:migrate-snapshot-index)
+--  ❌ NICHT ÄNDERN: Indexname idx_snapshots_time – wird in der
+--                   Prüf-Abfrage (npm run db:explain-cleanup) und im
+--                   Kommentar in worker.js (pollAndStore) referenziert.
+--
+--  PROBLEM (D1-Limit-Update):
+--    Der einzige bisherige Index auf rate_snapshots ist
+--    (item_key, fetched_at) aus 0001_init.sql. Das Aufräumen in
+--    pollAndStore() filtert aber NUR nach fetched_at:
+--
+--        DELETE FROM rate_snapshots WHERE fetched_at < ?
+--
+--    Ohne item_key kann SQLite den bisherigen Index nicht nutzen →
+--    Full Table Scan bei JEDEM Cron-Lauf (alle 15 Minuten). D1 zählt
+--    jede gescannte Zeile als "rows_read" – bei ca. 60.000 Zeilen in
+--    der Tabelle und 96 Läufen pro Tag sind das knapp 6 Mio. Zeilen
+--    pro Tag und damit mehr als das Free-Tier-Limit von 5 Mio.
+--
+--  LÖSUNG:
+--    Eigener Index nur auf fetched_at. Das DELETE liest danach nur
+--    noch die tatsächlich abgelaufenen Zeilen (meist: keine).
+--
+--  ⚠️ HINWEIS: Das Anlegen des Index schreibt einmalig einen
+--  Index-Eintrag pro vorhandener Zeile (rows_written) und liest die
+--  Tabelle einmal komplett (rows_read) – beides einmalig und im
+--  Free-Tier-Rahmen, aber nicht ausführen, solange das Tageslimit
+--  gerade erreicht ist (Reset: 00:00 UTC = 02:00 Uhr deutscher Zeit).
+--
+--  IF NOT EXISTS: Die Migration ist gefahrlos mehrfach ausführbar.
+-- ═══════════════════════════════════════════════════════════════
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_time
+  ON rate_snapshots (fetched_at);

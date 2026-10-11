@@ -10,6 +10,9 @@
     "db:seed": "wrangler d1 execute opapp-shards --remote --file=./migrations/0002_seed_all_time_high.sql",
     "db:migrate-peak": "wrangler d1 execute opapp-shards --remote --file=./migrations/0003_player_peak.sql",
     "db:migrate-daily-peak": "wrangler d1 execute opapp-shards --remote --file=./migrations/0004_daily_peak.sql",
+    "db:migrate-snapshot-index": "wrangler d1 execute opapp-shards --remote --file=./migrations/0005_snapshot_time_index.sql",
+    "db:explain-cleanup": "wrangler d1 execute opapp-shards --remote --command=\"EXPLAIN QUERY PLAN DELETE FROM rate_snapshots WHERE fetched_at < 0;\"",
+    "db:tables": "wrangler d1 execute opapp-shards --remote --command=\"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;\"",
     "db:ath": "wrangler d1 execute opapp-shards --remote --command=\"SELECT * FROM all_time_high;\"",
     "db:peak": "wrangler d1 execute opapp-shards --remote --command=\"SELECT * FROM player_count_peak;\"",
     "db:peak-today": "wrangler d1 execute opapp-shards --remote --command=\"SELECT * FROM daily_peak ORDER BY date DESC LIMIT 14;\""

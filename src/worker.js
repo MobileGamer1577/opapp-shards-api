@@ -30,10 +30,42 @@
 //  db:migrate-daily-peak) – sonst schlägt updateDailyPeak() im Cron mit
 //  einem SQL-Fehler fehl (wird nur geloggt, Tages-Peak bliebe bis zur
 //  Migration leer, kein harter Crash für den Rest des Workers).
+//
+//  ÄNDERUNGEN (D1-Limit-Update):
+//    - 🐛 Ursache für das erreichte D1-Free-Tier-Limit (5 Mio.
+//      rows_read/Tag): Das Aufräumen am Ende von pollAndStore()
+//      (DELETE FROM rate_snapshots WHERE fetched_at < ?) filtert nur
+//      nach fetched_at, der bisherige Index war aber (item_key,
+//      fetched_at) → Full Table Scan bei jedem 15-Minuten-Lauf, d.h.
+//      knapp 6 Mio. gelesene Zeilen pro Tag. Fix: neuer Index
+//      idx_snapshots_time (migrations/0005_snapshot_time_index.sql).
+//      Die DELETE-Abfrage selbst bleibt unverändert – SQLite wählt den
+//      neuen Index automatisch.
+//    - RETENTION_DAYS von 180 auf 60 gesenkt: Die App zeigt nur 7 und
+//      30 Tage Kursverlauf, die Allzeithochs liegen in einer eigenen
+//      Tabelle (all_time_high) und sind davon nicht betroffen. Hält
+//      rate_snapshots dauerhaft klein.
+//    - Cron-Trigger (wrangler.toml) bleibt bewusst UNVERÄNDERT bei
+//      jeder Minute: Der Health-Tick liest nur ca. 20–30 Zeilen pro
+//      Minute (< 1 % des Limits) – eine Umstellung auf */2 hätte das
+//      Limit praktisch nicht entlastet.
+//
+//  ⚠️ DEPLOY-REIHENFOLGE (D1-Limit-Update): Zuerst die Migration 0005
+//  remote ausführen, DANACH (am besten nach dem täglichen Reset um
+//  00:00 UTC) deployen – der erste Lauf mit RETENTION_DAYS = 60 löscht
+//  einmalig die ältesten ca. 30 Tage Snapshots. Details: siehe
+//  RELEASE_NOTES.md.
 // ═══════════════════════════════════════════════════════════════
 
 const RATES_URL = 'https://api.opsucht.net/merchant/rates';
-const RETENTION_DAYS = 180;
+
+// ✅ HIER ÄNDERN: Aufbewahrungsdauer der Kursverlauf-Snapshots in Tagen.
+// 60 reicht für die App (7/30-Tage-Ansicht) locker aus. Allzeithochs
+// (all_time_high) werden NICHT aufgeräumt und sind unabhängig davon.
+// Wichtig: Das Aufräumen in pollAndStore() ist nur dank des Index
+// idx_snapshots_time (Migration 0005) günstig – ohne ihn würde jeder
+// Lauf die komplette Tabelle scannen.
+const RETENTION_DAYS = 60;
 
 // ✅ NEU (Server-Status-Update): Live-Serverstatus für den Spieler-
 // Rekord. Bewusst "bc4.opsucht.iwmedia.ovh" statt "opsucht.net" (auf
@@ -164,6 +196,11 @@ async function pollAndStore(env) {
     ).bind(...seenKeys).run();
   }
 
+  // ✅ Aufräumen alter Snapshots. Dank des Index idx_snapshots_time
+  // (migrations/0005_snapshot_time_index.sql) liest D1 hier nur noch
+  // die tatsächlich abgelaufenen Zeilen statt die ganze Tabelle zu
+  // scannen (vorher: Full Table Scan bei jedem Lauf = Hauptursache für
+  // das erreichte rows_read-Tageslimit).
   const cutoff = now - RETENTION_DAYS * 24 * 60 * 60 * 1000;
   await env.DB.prepare(`DELETE FROM rate_snapshots WHERE fetched_at < ?`)
     .bind(cutoff)
